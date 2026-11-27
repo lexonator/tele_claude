@@ -37,6 +37,11 @@
 Файл `~/.tele_claude/config.json`: `chat_id` (группа), `allow_from` (кому можно писать боту), необязательно `token_file`
 (другой файл с токеном). Чужим бот не отвечает.
 
+## Права инструментов
+`bin/tele-claude` сам разрешает инструменты канала (`--allowedTools mcp__tele`), поэтому сессии в режиме «don't ask»
+могут отвечать в Telegram. Для сессий, запущенных не через него, добавьте в `~/.claude/settings.json`:
+`"permissions": { "allow": ["mcp__tele"] }`. Иначе ответ молча блокируется и в чате тишина.
+
 ## Устройство
 - `router/router.ts` — демон, единственный держатель токена (long polling), раздаёт сообщения по темам. Один экземпляр (замок).
 - `client/server.ts` — MCP-канал для сессии (reply, react, edit_message, download_attachment), говорит с роутером по unix-сокету.

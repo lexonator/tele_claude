@@ -31,4 +31,5 @@ export TELE_SESSION_DIR="$DIR"
 
 cd "$DIR"
 exec claude "${ARGS[@]}" \
+  --allowedTools "mcp__tele" \
   --dangerously-load-development-channels server:tele

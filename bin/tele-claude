@@ -1,0 +1,34 @@
+#!/bin/zsh
+# Запуск сессии Claude Code со своей темой в Telegram.
+#   tele-claude <каталог> [--name <название>] [--resume <id>] [прочие флаги claude]
+# Токен бота сюда не передаётся: его знает только роутер.
+set -e
+ROOT="${0:A:h:h}"
+# Сервер "tele" должен быть зарегистрирован один раз:
+#   claude mcp add --scope user tele -- bun <tele_claude>/client/server.ts
+
+if [[ $# -lt 1 || "$1" == -* ]]; then
+  echo "Использование: tele-claude <каталог> [--name <название>] [--resume <id>]" >&2
+  exit 2
+fi
+DIR="${1:A}"; shift
+[[ -d "$DIR" ]] || { echo "Нет каталога: $DIR" >&2; exit 2; }
+
+NAME="main"
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --name) NAME="$2"; shift 2 ;;
+    --main) export TELE_GENERAL=1; shift ;;   # главная сессия: общается в общей теме General
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+
+# Переменная TELEGRAM_BOT_TOKEN из ~/.zshrc (чужой бот) нам не нужна и мешать не должна.
+unset TELEGRAM_BOT_TOKEN
+export TELE_SESSION_NAME="$NAME"
+export TELE_SESSION_DIR="$DIR"
+
+cd "$DIR"
+exec claude "${ARGS[@]}" \
+  --dangerously-load-development-channels server:tele

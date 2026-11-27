@@ -1,0 +1,790 @@
+#!/usr/bin/env bun
+/**
+ * tele_claude router — единственный держатель токена бота.
+ *
+ * - long polling getUpdates (одно место на весь Mac);
+ * - сессии Claude Code подключаются по unix-сокету (JSON-строки), регистрируются,
+ *   и для каждой создаётся тема (forum topic) в супергруппе;
+ * - входящее из темы уходит только в свою сессию; исходящее идёт в свою тему.
+ *
+ * Токен читается из файла и нигде не печатается.
+ */
+import { Bot, GrammyError, InlineKeyboard, InputFile } from 'grammy'
+import type { ReactionTypeEmoji } from 'grammy/types'
+import { createServer, connect, type Socket } from 'net'
+import {
+  readdirSync, openSync, readSync, closeSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, renameSync,
+  statSync, realpathSync, chmodSync,
+} from 'fs'
+import { homedir } from 'os'
+import { join, extname, sep } from 'path'
+import { spawnSync } from 'child_process'
+import { chunk, parseEnv, describeTool, PERMISSION_REPLY_RE, PHOTO_EXTS, type Msg } from '../shared.ts'
+
+const HOME = homedir()
+const STATE_DIR = process.env.TELE_STATE_DIR ?? join(HOME, '.tele_claude')
+const SOCK = process.env.TELE_SOCK ?? join(STATE_DIR, 'router.sock')
+const CONFIG_FILE = join(STATE_DIR, 'config.json')
+const cfg0: { chat_id?: string; token_file?: string; access_file?: string; allow_from?: Array<string | number> } = (() => { try { return JSON.parse(readFileSync(CONFIG_FILE, 'utf8')) } catch { return {} } })()
+const expand = (p: string) => p.replace(/^~(?=\/|$)/, HOME)
+// Токен: ~/.tele_claude/.env (TELEGRAM_BOT_TOKEN=...) или другой файл из config.json (token_file).
+const TOKEN_FILE = process.env.TELE_TOKEN_FILE ?? expand(cfg0.token_file ?? join(STATE_DIR, '.env'))
+const ACCESS_FILE = process.env.TELE_ACCESS_FILE ?? (cfg0.access_file ? expand(cfg0.access_file) : '')
+const SESSIONS_FILE = join(STATE_DIR, 'sessions.json')
+const INBOX_DIR = join(STATE_DIR, 'inbox')
+const API_ROOT = process.env.TELE_API_ROOT // для тестов с поддельным Telegram
+const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+
+const log = (s: string) => process.stderr.write(`[router ${new Date().toISOString()}] ${s}\n`)
+
+mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
+
+// ---------- конфиг, токен, доступ ----------
+const TOKEN = process.env.TELE_BOT_TOKEN ?? parseEnv(readFileSync(TOKEN_FILE, 'utf8')).TELEGRAM_BOT_TOKEN
+if (!TOKEN) { log(`нет TELEGRAM_BOT_TOKEN в ${TOKEN_FILE}`); process.exit(1) }
+
+type Config = { chat_id: string }
+const config: Config = JSON.parse(readFileSync(CONFIG_FILE, 'utf8'))
+if (!config.chat_id) { log('в config.json нет chat_id'); process.exit(1) }
+const GROUP = String(config.chat_id)
+
+function allowedUsers(): string[] {
+  // Кому можно писать боту: allow_from в config.json (id пользователей Telegram) или файл access.json с полем allowFrom.
+  if (cfg0.allow_from?.length) return cfg0.allow_from.map(String)
+  if (!ACCESS_FILE) return []
+  try { return (JSON.parse(readFileSync(ACCESS_FILE, 'utf8')).allowFrom ?? []).map(String) } catch { return [] }
+}
+
+type Session = { key: string; name: string; dir: string; thread_id: number; created: number }
+let sessions: Record<string, Session> = {}
+try { sessions = JSON.parse(readFileSync(SESSIONS_FILE, 'utf8')) } catch {}
+function saveSessions() {
+  const tmp = SESSIONS_FILE + '.tmp'
+  writeFileSync(tmp, JSON.stringify(sessions, null, 2) + '\n', { mode: 0o600 })
+  renameSync(tmp, SESSIONS_FILE)
+}
+
+// ---------- бот ----------
+const bot = new Bot(TOKEN, API_ROOT ? { client: { apiRoot: API_ROOT } } : undefined)
+let botUsername = ''
+
+// ---------- подключённые клиенты ----------
+type Client = { sock: Socket; key: string; buf: string; general?: boolean }
+const clients = new Map<string, Client>() // key -> client
+let generalKey = '' // главная сессия: её чат — общая тема (General)
+const permOwner = new Map<string, string>() // request_id -> key
+const offlineNoticeAt = new Map<number, number>() // thread_id -> ts
+
+function send(sock: Socket, m: Msg) { if (!sock.destroyed) sock.write(JSON.stringify(m) + '\n') }
+function pushTo(key: string, m: Msg): boolean {
+  const c = clients.get(key)
+  if (!c) return false
+  send(c.sock, m)
+  return true
+}
+const sessionByThread = (tid: number) => Object.values(sessions).find(s => s.thread_id === tid)
+
+// ---------- темы ----------
+function threadOf(c: Client): number | undefined {
+  if (!c.key) throw new Error('not registered')
+  if (c.general) return undefined
+  const s = sessions[c.key]
+  if (!s) throw new Error('not registered')
+  return s.thread_id
+}
+
+function topicTitle(s: { name: string; dir: string }) {
+  const project = s.dir.split('/').filter(Boolean).pop() ?? 'session'
+  return `${project} — ${s.name}`.slice(0, 128)
+}
+
+async function ensureTopic(key: string, name: string, dir: string): Promise<Session> {
+  const existing = sessions[key]
+  if (existing) {
+    // Название темы не трогаем (пользователь мог переименовать), и в Telegram лишний раз не ходим:
+    // иначе при перезапуске роутера 20 сессий разом упираются в лимит запросов.
+    sessions[key] = { ...existing, name, dir }
+    saveSessions()
+    return sessions[key]!
+  }
+  const t = await bot.api.createForumTopic(GROUP, topicTitle({ name, dir }))
+  const s: Session = { key, name, dir, thread_id: t.message_thread_id, created: Date.now() }
+  sessions[key] = s
+  saveSessions()
+  log(`создана тема ${s.thread_id} для ${key}`)
+  return s
+}
+
+// ---------- запрещённые для отправки файлы ----------
+function assertSendable(f: string) {
+  let real: string
+  try { real = realpathSync(f) } catch { return } // statSync сам упадёт
+  const guarded = [STATE_DIR, join(HOME, '.claude/channels')]
+  for (const g of guarded) {
+    let gr: string
+    try { gr = realpathSync(g) } catch { continue }
+    const inbox = join(gr, 'inbox')
+    if (real.startsWith(gr + sep) && !real.startsWith(inbox + sep)) {
+      throw new Error(`refusing to send channel state: ${f}`)
+    }
+  }
+}
+
+// ---------- «живой» статус сессии: анимация печати и что она сейчас делает ----------
+type Act = { watch?: ReturnType<typeof setInterval>; hooked?: boolean; thread?: number; typing: ReturnType<typeof setInterval>; kill: ReturnType<typeof setTimeout>; msgId?: number; text: string; lastEdit: number; pending?: string }
+const activity = new Map<string, Act>()
+
+// Номера сообщений-статусов храним на диске: если роутер перезапустят посреди работы,
+// при старте удаляем «осиротевшие» строки статуса, чтобы они не оставались мусором в чате.
+const STATUS_FILE = join(STATE_DIR, 'status-msgs.json')
+const statusMsgs: Record<string, number> = {}
+function saveStatus() { try { writeFileSync(STATUS_FILE, JSON.stringify(statusMsgs)) } catch {} }
+function cleanOrphanStatuses() {
+  try {
+    const old = JSON.parse(readFileSync(STATUS_FILE, 'utf8')) as Record<string, number>
+    for (const id of Object.values(old)) void bot.api.deleteMessage(GROUP, id).catch(() => {})
+    writeFileSync(STATUS_FILE, '{}')
+  } catch {}
+}
+
+const threadForKey = (key: string): number | undefined => clients.get(key)?.general ? undefined : sessions[key]?.thread_id
+const withThread = (t?: number) => (t != null ? { message_thread_id: t } : {})
+
+function actStart(key: string, text = '💭 Думаю…') {
+  const prev = activity.get(key)
+  if (prev) { actSet(key, text); return }
+  const thread = threadForKey(key)
+  const typing = setInterval(() => void bot.api.sendChatAction(GROUP, 'typing', withThread(thread)).catch(() => {}), 4000)
+  const kill = setTimeout(() => actStop(key), 15 * 60_000) // страховка, если «стоп» не пришёл
+  const a: Act = { thread, typing, kill, text: '', lastEdit: 0, hooked: true }
+  activity.set(key, a)
+  a.watch = watchTranscript(key)
+  void bot.api.sendChatAction(GROUP, 'typing', withThread(thread)).catch(() => {})
+  actSet(key, text)
+}
+
+function actSet(key: string, text: string) {
+  const a = activity.get(key)
+  if (process.env.TELE_DEBUG) log(`actSet ${key.split('/').pop()} active=${!!a} text=${text.slice(0, 60)}`)
+  if (!a || a.text === text) return
+  a.text = text
+  const now = Date.now()
+  if (a.msgId == null) {
+    a.lastEdit = now
+    a.msgId = -1 // занято: сообщение создаётся
+    void bot.api.sendMessage(GROUP, text, { ...withThread(a.thread), disable_notification: true, reply_markup: stopKb(a.thread != null ? String(a.thread) : 'g') })
+      .then(m => {
+        const cur = activity.get(key)
+        if (cur === a) { a.msgId = m.message_id; statusMsgs[key] = m.message_id; saveStatus(); if (a.text !== text) flushStatus(key) }
+        else void bot.api.deleteMessage(GROUP, m.message_id).catch(() => {})
+      })
+      .catch(e => { log(`статус: sendMessage не удался: ${e}`); if (activity.get(key) === a) a.msgId = undefined })
+    return
+  }
+  if (a.msgId < 0 || now - a.lastEdit < 1500) {
+    a.pending = text
+    setTimeout(() => flushStatus(key), 1600)
+    return
+  }
+  flushStatus(key)
+}
+
+function flushStatus(key: string) {
+  const a = activity.get(key)
+  if (!a || a.msgId == null || a.msgId < 0) return
+  if (Date.now() - a.lastEdit < 1500) return
+  a.lastEdit = Date.now()
+  a.pending = undefined
+  void bot.api.editMessageText(GROUP, a.msgId, a.text, { reply_markup: stopKb(a.thread != null ? String(a.thread) : 'g') }).catch(e => { if (!/not modified/i.test(String(e))) log(`статус: edit не удался: ${e}`) })
+}
+
+// Читаем «хвост» журнала сессии Claude Code (jsonl): оттуда видно, какие инструменты вызываются,
+// а иногда и ход рассуждений. Работает без хуков и без перезапуска сессии.
+function newestTranscript(dir: string): string | undefined {
+  const pd = join(process.env.TELE_PROJECTS_DIR ?? join(HOME, '.claude', 'projects'), dir.replace(/[^A-Za-z0-9]/g, '-'))
+  try {
+    let best: { f: string; t: number } | undefined
+    for (const n of readdirSync(pd)) {
+      if (!n.endsWith('.jsonl')) continue
+      const f = join(pd, n), t = statSync(f).mtimeMs
+      if (!best || t > best.t) best = { f, t }
+    }
+    return best?.f
+  } catch { return undefined }
+}
+
+function watchTranscript(key: string): ReturnType<typeof setInterval> {
+  const dir = key.split('::')[0]!
+  let file = newestTranscript(dir)
+  let offset = 0
+  try { if (file) offset = statSync(file).size } catch {}
+  let rest = ''
+  return setInterval(() => {
+    try {
+      const latest = newestTranscript(dir)
+      if (latest && latest !== file) { file = latest; try { offset = statSync(latest).size } catch { offset = 0 }; rest = '' } // новый файл читаем с конца, чтобы не проигрывать старое
+      if (!file) return
+      const size = statSync(file).size
+      if (size <= offset) return
+      const fd = openSync(file, 'r')
+      const buf = Buffer.alloc(Math.min(size - offset, 1 << 20))
+      readSync(fd, buf, 0, buf.length, offset); closeSync(fd)
+      offset += buf.length
+      const lines = (rest + buf.toString('utf8')).split('\n'); rest = lines.pop() ?? ''
+      for (const line of lines) {
+        let e: any; try { e = JSON.parse(line) } catch { continue }
+        const msg = e?.message
+        if (e?.type === 'assistant' && Array.isArray(msg?.content)) {
+          for (const b of msg.content) {
+            if (b.type === 'tool_use') { const d = describeTool(b.name, b.input); if (d) actSet(key, d) }
+            else if (b.type === 'thinking' && b.thinking) actSet(key, '💭 ' + String(b.thinking).replace(/\s+/g, ' ').trim().slice(-240))
+          }
+          if (msg.stop_reason === 'end_turn') actStop(key)
+        } else if (e?.type === 'user' && JSON.stringify(msg?.content ?? '').includes('Request interrupted')) {
+          actStop(key) // ход прерван (Esc)
+        } else if (e?.type === 'user' && Array.isArray(msg?.content) && msg.content.some((b: any) => b.type === 'tool_result')) {
+          // результат инструмента получен — модель снова думает (если не пришло ничего нового, строка останется как есть)
+        }
+      }
+    } catch {}
+  }, 700)
+}
+
+function actStop(key: string) {
+  const a = activity.get(key)
+  if (!a) return
+  activity.delete(key)
+  clearInterval(a.typing); clearTimeout(a.kill); if (a.watch) clearInterval(a.watch)
+  if (a.msgId != null && a.msgId > 0) void bot.api.deleteMessage(GROUP, a.msgId).catch(() => {})
+  if (statusMsgs[key] != null) { delete statusMsgs[key]; saveStatus() }
+}
+
+// ---------- обработка запросов клиента ----------
+async function handleOp(c: Client, m: Msg): Promise<unknown> {
+  switch (m.op) {
+    case 'register': {
+      const key = String(m.key), name = String(m.name), dir = String(m.dir)
+      const old = clients.get(key)
+      if (old && old.sock !== c.sock) {
+        log(`сессия ${key} подключилась повторно — старое соединение закрыто`)
+        old.sock.destroy()
+      }
+      c.key = key
+      if (m.general) {
+        // главная сессия живёт в общей теме, своей темы не создаём
+        c.general = true
+        generalKey = key
+        clients.set(key, c)
+        log(`сессия ${key} онлайн как главная (General)`)
+        return { chat_id: GROUP, thread_id: null, title: 'General' }
+      }
+      const s = await ensureTopic(key, name, dir)
+      clients.set(key, c)
+      log(`сессия ${key} онлайн (тема ${s.thread_id})`)
+      return { chat_id: GROUP, thread_id: s.thread_id, title: topicTitle(s) }
+    }
+    case 'reply': {
+      const thread = threadOf(c)
+      const text = String(m.text ?? '')
+      const files = (m.files as string[] | undefined) ?? []
+      const replyTo = m.reply_to != null ? Number(m.reply_to) : undefined
+      const parse_mode = m.format === 'markdownv2' ? ('MarkdownV2' as const) : undefined
+      for (const f of files) {
+        assertSendable(f)
+        const st = statSync(f)
+        if (st.size > MAX_ATTACHMENT_BYTES) {
+          throw new Error(`file too large: ${f} (${(st.size / 1048576).toFixed(1)}MB, max 50MB)`)
+        }
+      }
+      const ids: number[] = []
+      const parts = chunk(text, 4096, 'length')
+      try {
+        for (let i = 0; i < parts.length; i++) {
+          const sent = await bot.api.sendMessage(GROUP, parts[i]!, {
+            ...(thread != null ? { message_thread_id: thread } : {}),
+            ...(replyTo != null && i === 0 ? { reply_parameters: { message_id: replyTo } } : {}),
+            ...(parse_mode ? { parse_mode } : {}),
+          })
+          ids.push(sent.message_id)
+        }
+      } catch (e) {
+        throw new Error(`reply failed after ${ids.length} of ${parts.length} chunk(s) sent: ${e instanceof Error ? e.message : e}`)
+      }
+      for (const f of files) {
+        const input = new InputFile(f)
+        const opts = thread != null ? { message_thread_id: thread } : {}
+        const sent = PHOTO_EXTS.has(extname(f).toLowerCase())
+          ? await bot.api.sendPhoto(GROUP, input, opts)
+          : await bot.api.sendDocument(GROUP, input, opts)
+        ids.push(sent.message_id)
+      }
+      { const a = activity.get(c.key); if (a && !a.hooked) actStop(c.key) } // у сессии нет хуков — снимаем статус по ответу
+      return { ids }
+    }
+    case 'react': {
+      await bot.api.setMessageReaction(GROUP, Number(m.message_id), [
+        { type: 'emoji', emoji: String(m.emoji) as ReactionTypeEmoji['emoji'] },
+      ])
+      return {}
+    }
+    case 'edit': {
+      const parse_mode = m.format === 'markdownv2' ? ('MarkdownV2' as const) : undefined
+      const r = await bot.api.editMessageText(GROUP, Number(m.message_id), String(m.text), parse_mode ? { parse_mode } : undefined)
+      return { id: typeof r === 'object' ? r.message_id : m.message_id }
+    }
+    case 'download': {
+      return { path: await downloadFile(String(m.file_id)) }
+    }
+    case 'permission_request': {
+      const thread = threadOf(c)
+      const id = String(m.request_id)
+      permOwner.set(id, c.key)
+      permDetails.set(id, { tool_name: String(m.tool_name), description: String(m.description), input_preview: String(m.input_preview) })
+      const kb = new InlineKeyboard()
+        .text('See more', `perm:more:${id}`)
+        .text('✅ Allow', `perm:allow:${id}`)
+        .text('❌ Deny', `perm:deny:${id}`)
+      await bot.api.sendMessage(GROUP, `🔐 Permission: ${m.tool_name}`, { ...(thread != null ? { message_thread_id: thread } : {}), reply_markup: kb })
+      return {}
+    }
+    case 'activity': {
+      // Приходит от хуков Claude Code (bin/tele-hook): сокет без регистрации, ключ в сообщении.
+      const key = String(m.key ?? c.key)
+      if (!clients.has(key)) return {}
+      if (m.kind === 'stop') actStop(key)
+      else { actStart(key, String(m.text || '💭 Думаю…').slice(0, 300)); const a = activity.get(key); if (a) a.hooked = true }
+      return {}
+    }
+    case 'ping':
+      return { pong: true }
+    default:
+      throw new Error(`unknown op: ${m.op}`)
+  }
+}
+const permDetails = new Map<string, { tool_name: string; description: string; input_preview: string }>()
+
+async function downloadFile(file_id: string, uniqueHint = 'dl'): Promise<string> {
+  const file = await bot.api.getFile(file_id)
+  if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
+  const base = API_ROOT ?? 'https://api.telegram.org'
+  const res = await fetch(`${base}/file/bot${TOKEN}/${file.file_path}`)
+  if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
+  const buf = Buffer.from(await res.arrayBuffer())
+  const ext = (file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin').replace(/[^a-zA-Z0-9]/g, '') || 'bin'
+  const uid = (file.file_unique_id ?? uniqueHint).replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
+  const path = join(INBOX_DIR, `${Date.now()}-${uid}.${ext}`)
+  writeFileSync(path, buf)
+  return path
+}
+
+// ---------- unix-сокет ----------
+async function socketAlive(): Promise<boolean> {
+  if (!existsSync(SOCK)) return false
+  return new Promise(res => {
+    const s = connect(SOCK)
+    s.once('connect', () => { s.destroy(); res(true) })
+    s.once('error', () => res(false))
+  })
+}
+// Замок: если много клиентов одновременно запускают роутер, живёт только один.
+const LOCK = join(STATE_DIR, 'router.lock')
+for (let tries = 0; ; tries++) {
+  try { writeFileSync(LOCK, String(process.pid), { flag: 'wx' }); break } catch {}
+  let holder = 0
+  try { holder = parseInt(readFileSync(LOCK, 'utf8'), 10) } catch {}
+  let alive = false
+  if (holder > 1 && holder !== process.pid) { try { process.kill(holder, 0); alive = true } catch {} }
+  if (alive) { log(`роутер уже запущен (pid ${holder}) — выхожу`); process.exit(0) }
+  try { unlinkSync(LOCK) } catch {}
+  if (tries > 5) { log('не удалось взять замок'); process.exit(1) }
+}
+if (await socketAlive()) { log('роутер уже запущен — выхожу'); process.exit(0) }
+try { unlinkSync(SOCK) } catch {}
+
+const server = createServer(sock => {
+  const c: Client = { sock, key: '', buf: '' }
+  sock.setEncoding('utf8')
+  sock.on('data', (d: string) => {
+    c.buf += d
+    let i: number
+    while ((i = c.buf.indexOf('\n')) >= 0) {
+      const line = c.buf.slice(0, i); c.buf = c.buf.slice(i + 1)
+      if (!line.trim()) continue
+      let m: Msg
+      try { m = JSON.parse(line) } catch { continue }
+      handleOp(c, m).then(
+        result => send(sock, { id: m.id, ok: true, result }),
+        err => send(sock, { id: m.id, ok: false, error: err instanceof Error ? err.message : String(err) }),
+      )
+    }
+  })
+  const drop = () => {
+    if (c.key && clients.get(c.key) === c) { actStop(c.key); clients.delete(c.key); if (generalKey === c.key) generalKey = ''; log(`сессия ${c.key} отключилась`) }
+  }
+  sock.on('close', drop)
+  sock.on('error', drop)
+})
+server.listen(SOCK, () => { chmodSync(SOCK, 0o600); log(`сокет ${SOCK}`) })
+writeFileSync(join(STATE_DIR, 'router.pid'), String(process.pid))
+cleanOrphanStatuses() // только после того, как взяли замок: единственный живой роутер
+
+// ---------- входящее из Telegram ----------
+const isAllowed = (id: number | undefined) => id != null && allowedUsers().includes(String(id))
+
+async function handleInbound(ctx: any, text: string, dl?: () => Promise<string | undefined>, att?: Record<string, string>) {
+  const from = ctx.from
+  if (!isAllowed(from?.id)) return // чужим молча не отвечаем
+  const chatType = ctx.chat?.type
+  const chatId = String(ctx.chat.id)
+  const tid: number | undefined = ctx.message?.message_thread_id
+
+  const isGroup = (chatType === 'supergroup' || chatType === 'group') && chatId === GROUP
+  const isDm = chatType === 'private'
+  if (!isGroup && !isDm) return
+
+  if (/^\/(stop|esc)(@\w+)?(\s|$)/i.test(text)) {
+    const key = keyFor(tid)
+    const opts = tid != null ? { message_thread_id: tid } : {}
+    const msg = key && clients.has(key) ? interrupt(key) : 'Для этой темы нет запущенной сессии.'
+    return void (await bot.api.sendMessage(GROUP, msg, opts).catch(() => {}))
+  }
+  if (/^\/(screen|browser)(@\w+)?(\s|$)/i.test(text)) {
+    const key = keyFor(tid)
+    const opts = tid != null ? { message_thread_id: tid } : {}
+    if (!key || !clients.has(key)) return void (await bot.api.sendMessage(GROUP, 'Для этой темы нет запущенной сессии.', opts).catch(() => {}))
+    browserAsk(key, 'shot', from)
+    await bot.api.sendMessage(GROUP, 'Браузер этой сессии. Делаю скриншот. Кнопки ниже управляют вкладкой, а любое действие можно написать словами: «нажми Войти», «введи …».', { ...opts, reply_markup: browserPanel(tid != null ? String(tid) : 'g') }).catch(() => {})
+    return
+  }
+  if (/^\/windows(@\w+)?(\s|$)/i.test(text) || (/^\/(show|hide)(@\w+)?\s*$/i.test(text) && tid == null)) {
+    const p = windowsPanel()
+    return void (await bot.api.sendMessage(ctx.chat.id, p.text, { ...(tid != null ? { message_thread_id: tid } : {}), reply_markup: p.kb }).catch(() => {}))
+  }
+  if (/^\/(show|hide|hideall)(@\w+)?(\s|$)/i.test(text)) return void (await windowCommand(ctx, text, tid))
+
+  // служебные команды: в общей теме или в личке
+  if (isDm || tid == null || !sessionByThread(tid)) {
+    if (/^\/(sessions|help|start)(@\w+)?\b/.test(text)) return void (await serviceCommand(ctx, text, tid))
+    // обычное сообщение в General — главной сессии
+    if (isGroup && tid == null && generalKey && clients.has(generalKey)) {
+      actStart(generalKey)
+      const imagePath = dl ? await dl() : undefined
+      pushTo(generalKey, {
+        event: 'inbound', content: text,
+        meta: {
+          chat_id: GROUP, message_id: String(ctx.message.message_id),
+          user: from.username ?? String(from.id), user_id: String(from.id),
+          ts: new Date((ctx.message.date ?? 0) * 1000).toISOString(),
+          ...(imagePath ? { image_path: imagePath } : {}), ...(att ?? {}),
+        },
+      })
+      return
+    }
+    if (isGroup && tid != null) return // тема без сессии (чужая тема) — молчим
+    if (isDm) {
+      await ctx.reply('Пишите в темы группы: у каждой сессии Claude своя тема. Команда /sessions покажет список.')
+    }
+    return
+  }
+
+  const s = sessionByThread(tid)!
+  const msgId = ctx.message.message_id as number
+
+  const perm = PERMISSION_REPLY_RE.exec(text)
+  if (perm && clients.has(s.key)) {
+    const behavior = perm[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny'
+    pushTo(s.key, { event: 'permission', request_id: perm[2]!.toLowerCase(), behavior })
+    void bot.api.setMessageReaction(GROUP, msgId, [{ type: 'emoji', emoji: (behavior === 'allow' ? '✅' : '❌') as ReactionTypeEmoji['emoji'] }]).catch(() => {})
+    return
+  }
+
+  if (!clients.has(s.key)) {
+    const last = offlineNoticeAt.get(tid) ?? 0
+    if (Date.now() - last > 60_000) {
+      offlineNoticeAt.set(tid, Date.now())
+      await bot.api.sendMessage(GROUP, 'Эта сессия сейчас не запущена. Запустите её: tele-claude ' + s.dir + (s.name !== 'main' ? ` --name ${s.name}` : ''), { message_thread_id: tid }).catch(() => {})
+    }
+    return
+  }
+
+  actStart(s.key)
+  const imagePath = dl ? await dl() : undefined
+  pushTo(s.key, {
+    event: 'inbound',
+    content: text,
+    meta: {
+      chat_id: GROUP,
+      thread_id: String(tid),
+      message_id: String(msgId),
+      user: from.username ?? String(from.id),
+      user_id: String(from.id),
+      ts: new Date((ctx.message.date ?? 0) * 1000).toISOString(),
+      ...(imagePath ? { image_path: imagePath } : {}),
+      ...(att ?? {}),
+    },
+  })
+}
+
+// ---------- окна терминала (tmux) ----------
+const TMUX = ['/opt/homebrew/bin/tmux', '/usr/local/bin/tmux', '/usr/bin/tmux'].find(p => existsSync(p)) ?? 'tmux'
+const tmux = (...a: string[]) => spawnSync(TMUX, a, { encoding: 'utf8' })
+function teleTmuxSessions(): string[] {
+  const r = tmux('list-sessions', '-F', '#{session_name}')
+  return r.status === 0 ? r.stdout.split('\n').filter(n => n.startsWith('tele-')) : []
+}
+function attachedClients(name: string): number {
+  const r = tmux('list-clients', '-t', name)
+  return r.status === 0 ? r.stdout.split('\n').filter(Boolean).length : 0
+}
+function tmuxNameFor(s: { dir: string }) {
+  return 'tele-' + (s.dir.split('/').filter(Boolean).pop() ?? 'main').replace(/[^A-Za-z0-9_-]/g, '_')
+}
+// Ищем tmux-сессию по аргументу (часть имени) или по теме, откуда пришла команда.
+function resolveWindow(arg: string, tid?: number): { name?: string; error?: string } {
+  const all = teleTmuxSessions()
+  const a = arg.trim().toLowerCase().replace(/^tele-/, '')
+  if (a) {
+    const hit = all.filter(n => n.toLowerCase().includes(a))
+    const exact = all.find(n => n.toLowerCase() === 'tele-' + a)
+    if (exact) return { name: exact }
+    if (hit.length === 1) return { name: hit[0] }
+    if (hit.length > 1) return { error: 'Подходит несколько: ' + hit.join(', ') }
+    return { error: `Нет сессии «${arg}». Доступные: ${all.join(', ') || 'пока нет'}` }
+  }
+  const s = tid != null ? sessionByThread(tid) : generalKey ? { dir: generalKey.split('::')[0]! } : undefined
+  if (!s) return { error: 'Укажите имя: /show <имя>. Доступные: ' + (all.join(', ') || 'пока нет') }
+  const name = tmuxNameFor(s)
+  return all.includes(name) ? { name } : { error: `У этой сессии нет tmux-окна (${name}). Она запущена не через tmux.` }
+}
+// ---------- управление вкладкой Chrome через Telegram ----------
+const BROWSER_ACTIONS: Record<string, [string, string]> = {
+  shot: ['📸 Скриншот', 'Сделай скриншот текущей вкладки в Chrome'],
+  up: ['⬆️ Вверх', 'Прокрути текущую вкладку в Chrome вверх на экран, затем сделай скриншот'],
+  down: ['⬇️ Вниз', 'Прокрути текущую вкладку в Chrome вниз на экран, затем сделай скриншот'],
+  back: ['◀️ Назад', 'В текущей вкладке Chrome вернись назад по истории, затем сделай скриншот'],
+  reload: ['🔁 Обновить', 'Перезагрузи текущую вкладку в Chrome, подожди загрузки, затем сделай скриншот'],
+}
+function browserPanel(ref: string): InlineKeyboard {
+  const kb = new InlineKeyboard()
+  const ks = Object.keys(BROWSER_ACTIONS)
+  ks.forEach((k, i) => { kb.text(BROWSER_ACTIONS[k]![0], `br:${k}:${ref}`); if (i === 2) kb.row() })
+  return kb
+}
+// Просим сессию выполнить действие в браузере (инструменты Claude in Chrome есть у самой сессии).
+function browserAsk(key: string, act: string, from: { id: number; username?: string }): boolean {
+  const a = BROWSER_ACTIONS[act]
+  if (!a) return false
+  const text = `[Telegram: управление браузером] ${a[1]} и пришли его картинкой через reply (files). Одной строкой скажи, что на странице и что можно сделать дальше. Если вкладки нет, скажи об этом.`
+  actStart(key)
+  return pushTo(key, {
+    event: 'inbound', content: text,
+    meta: { chat_id: GROUP, ...(sessions[key] && !clients.get(key)?.general ? { thread_id: String(sessions[key]!.thread_id) } : {}),
+      user: from.username ?? String(from.id), user_id: String(from.id), ts: new Date().toISOString() },
+  })
+}
+function keyFor(tid?: number): string | undefined {
+  if (tid != null) return sessionByThread(tid)?.key
+  return generalKey || undefined
+}
+
+// Аналог Esc: отправляем клавишу Escape в tmux-окно сессии — Claude Code прерывает текущий ход.
+function interrupt(key: string): string {
+  const dir = key.split('::')[0]!
+  const name = tmuxNameFor({ dir })
+  if (!teleTmuxSessions().includes(name)) return 'У этой сессии нет tmux-окна, прервать не могу.'
+  tmux('send-keys', '-t', name, 'Escape')
+  return 'Отправил Esc: сессия прервёт текущее действие.'
+}
+const stopKb = (ref: string) => new InlineKeyboard().text('⛔ Прервать', `stop:${ref}`)
+
+function windowsPanel(): { text: string; kb: InlineKeyboard } {
+  const all = teleTmuxSessions().filter(n => n.length <= 55)
+  const kb = new InlineKeyboard()
+  const open = all.filter(n => attachedClients(n) > 0).length
+  all.forEach((n, i) => {
+    kb.text(`${attachedClients(n) > 0 ? '🪟' : '▫️'} ${n.replace(/^tele-/, '')}`, `win:t:${n}`)
+    if (i % 2 === 1) kb.row()
+  })
+  kb.row().text('🔄 Обновить', 'win:r').text('🙈 Скрыть все', 'win:h')
+  const text = all.length
+    ? `Окна сессий. Нажмите на имя, чтобы открыть или скрыть.\n🪟 открыто: ${open}   ▫️ скрыто: ${all.length - open}`
+    : 'Сессий в tmux пока нет.'
+  return { text, kb }
+}
+
+async function windowCommand(ctx: any, text: string, tid?: number) {
+  const m = /^\/(show|hide|hideall)(?:@\w+)?(?:\s+(.+))?$/i.exec(text.trim())!
+  const cmd = m[1]!.toLowerCase(), arg = m[2] ?? ''
+  const say = (t: string) => bot.api.sendMessage(ctx.chat.id, t, tid != null ? { message_thread_id: tid } : {}).catch(() => {})
+  if (cmd === 'hideall') {
+    const all = teleTmuxSessions().filter(n => attachedClients(n) > 0)
+    for (const n of all) tmux('detach-client', '-s', n)
+    return void (await say(all.length ? `Скрыл окна: ${all.length}. Сессии работают.` : 'Открытых окон нет.'))
+  }
+  if (cmd !== 'hideall' && !arg.trim() && (tid == null || !sessionByThread(tid)) && !generalKey) {
+    const p = windowsPanel()
+    return void (await bot.api.sendMessage(ctx.chat.id, p.text, { ...(tid != null ? { message_thread_id: tid } : {}), reply_markup: p.kb }).catch(() => {}))
+  }
+  const r = resolveWindow(arg, tid)
+  if (!r.name) return void (await say(r.error!))
+  if (cmd === 'hide') {
+    if (!attachedClients(r.name)) return void (await say(`Окно ${r.name} и так не открыто.`))
+    tmux('detach-client', '-s', r.name)
+    return void (await say(`Скрыл окно ${r.name}. Сессия работает.`))
+  }
+  if (attachedClients(r.name)) return void (await say(`Окно ${r.name} уже открыто.`))
+  const script = `tell application "Terminal"\nactivate\ndo script "${TMUX} attach -t ${r.name}; exit"\nend tell`
+  const o = spawnSync('osascript', ['-e', script], { encoding: 'utf8' })
+  await say(o.status === 0 ? `Открыл окно ${r.name}.` : `Не получилось открыть окно: ${(o.stderr || '').trim().slice(0, 200)}`)
+}
+
+async function serviceCommand(ctx: any, text: string, tid?: number) {
+  const opts = tid != null ? { message_thread_id: tid } : {}
+  const chatId = ctx.chat.id
+  if (/^\/sessions/.test(text)) {
+    const list = Object.values(sessions)
+    const lines = list.length
+      ? list.map(s => `${clients.has(s.key) ? '🟢' : '⚪️'} ${topicTitle(s)}`).join('\n')
+      : 'Сессий пока нет.'
+    await bot.api.sendMessage(chatId, lines + '\n\n🟢 запущена, ⚪️ не запущена', opts)
+  } else {
+    await bot.api.sendMessage(chatId, 'У каждой сессии Claude Code своя тема. Пишите в тему, и сообщение попадёт только в эту сессию.\n\n/windows — окна кнопками\n/sessions — список сессий\n/show <имя> — открыть окно терминала с сессией (в теме сессии имя не нужно)\n/hide <имя> — скрыть окно, сессия продолжит работать\n/hideall — скрыть все окна', opts)
+  }
+}
+
+const safeName = (s?: string) => s?.replace(/[<>\[\]\r\n;]/g, '_')
+
+bot.on('message:text', ctx => handleInbound(ctx, ctx.message.text))
+bot.on('message:photo', ctx => {
+  const best = ctx.message.photo[ctx.message.photo.length - 1]!
+  return handleInbound(ctx, ctx.message.caption ?? '(photo)', async () => {
+    try { return await downloadFile(best.file_id, best.file_unique_id) } catch (e) { log(`photo download failed: ${e}`); return undefined }
+  })
+})
+const fileKinds: Array<[string, (m: any) => any, (m: any) => string]> = [
+  ['document', m => m.document, m => `(document: ${safeName(m.document.file_name) ?? 'file'})`],
+  ['voice', m => m.voice, () => '(voice message)'],
+  ['audio', m => m.audio, m => `(audio: ${safeName(m.audio.title) ?? safeName(m.audio.file_name) ?? 'audio'})`],
+  ['video', m => m.video, () => '(video)'],
+  ['video_note', m => m.video_note, () => '(video note)'],
+  ['sticker', m => m.sticker, m => `(sticker${m.sticker.emoji ? ' ' + m.sticker.emoji : ''})`],
+]
+for (const [kind, get, label] of fileKinds) {
+  bot.on(`message:${kind}` as 'message:document', ctx => {
+    const f = get(ctx.message)
+    return handleInbound(ctx, ctx.message.caption ?? label(ctx.message), undefined, {
+      attachment_kind: kind,
+      attachment_file_id: f.file_id,
+      ...(f.file_size != null ? { attachment_size: String(f.file_size) } : {}),
+      ...(f.mime_type ? { attachment_mime: f.mime_type } : {}),
+      ...(f.file_name ? { attachment_name: safeName(f.file_name)! } : {}),
+    })
+  })
+}
+
+bot.on('callback_query:data', async ctx => {
+  if (ctx.callbackQuery.data.startsWith('stop:')) {
+    if (!isAllowed(ctx.from.id)) return void ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    const ref = ctx.callbackQuery.data.slice(5)
+    const key = keyFor(ref === 'g' ? undefined : Number(ref))
+    return void ctx.answerCallbackQuery({ text: key && clients.has(key) ? interrupt(key) : 'Сессия не запущена' }).catch(() => {})
+  }
+  if (ctx.callbackQuery.data.startsWith('br:')) {
+    if (!isAllowed(ctx.from.id)) return void ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    const [, act, ref] = ctx.callbackQuery.data.split(':') as [string, string, string]
+    const key = keyFor(ref === 'g' ? undefined : Number(ref))
+    const ok = !!key && clients.has(key) && browserAsk(key, act!, ctx.from)
+    return void ctx.answerCallbackQuery({ text: ok ? 'Передал сессии…' : 'Сессия не запущена' }).catch(() => {})
+  }
+  if (ctx.callbackQuery.data.startsWith('win:')) {
+    if (!isAllowed(ctx.from.id)) return void ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    const d = ctx.callbackQuery.data
+    let note = ''
+    if (d === 'win:h') {
+      const n = teleTmuxSessions().filter(x => attachedClients(x) > 0)
+      n.forEach(x => tmux('detach-client', '-s', x))
+      note = n.length ? `Скрыто окон: ${n.length}` : 'Открытых окон нет'
+    } else if (d.startsWith('win:t:')) {
+      const name = d.slice(6)
+      if (!teleTmuxSessions().includes(name)) note = 'Сессия не найдена'
+      else if (attachedClients(name) > 0) { tmux('detach-client', '-s', name); note = 'Скрыто' }
+      else {
+        const script = `tell application "Terminal"\nactivate\ndo script "${TMUX} attach -t ${name}; exit"\nend tell`
+        note = spawnSync('osascript', ['-e', script], { encoding: 'utf8' }).status === 0 ? 'Открыто' : 'Не удалось открыть окно'
+      }
+    }
+    await Bun.sleep(400) // дать tmux/Terminal обновить число клиентов
+    const p = windowsPanel()
+    await ctx.editMessageText(p.text, { reply_markup: p.kb }).catch(() => {})
+    return void ctx.answerCallbackQuery({ text: note || undefined }).catch(() => {})
+  }
+  const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(ctx.callbackQuery.data)
+  if (!m || !isAllowed(ctx.from.id)) return void ctx.answerCallbackQuery({ text: m ? 'Not authorized.' : undefined }).catch(() => {})
+  const [, behavior, id] = m as unknown as [string, string, string]
+  if (behavior === 'more') {
+    const d = permDetails.get(id)
+    if (!d) return void ctx.answerCallbackQuery({ text: 'Details no longer available.' }).catch(() => {})
+    let pretty = d.input_preview
+    try { pretty = JSON.stringify(JSON.parse(d.input_preview), null, 2) } catch {}
+    const kb = new InlineKeyboard().text('✅ Allow', `perm:allow:${id}`).text('❌ Deny', `perm:deny:${id}`)
+    await ctx.editMessageText(`🔐 Permission: ${d.tool_name}\n\ndescription: ${d.description}\ninput_preview:\n${pretty}`, { reply_markup: kb }).catch(() => {})
+    return void ctx.answerCallbackQuery().catch(() => {})
+  }
+  const owner = permOwner.get(id)
+  if (owner) pushTo(owner, { event: 'permission', request_id: id, behavior })
+  permOwner.delete(id); permDetails.delete(id)
+  const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
+  await ctx.answerCallbackQuery({ text: label }).catch(() => {})
+  const msg = ctx.callbackQuery.message
+  if (msg && 'text' in msg && msg.text) await ctx.editMessageText(`${msg.text}\n\n${label}`).catch(() => {})
+})
+
+bot.catch(err => log(`handler error (polling continues): ${err.error}`))
+
+// ---------- запуск и остановка ----------
+let stopping = false
+function shutdown() {
+  if (stopping) return
+  stopping = true
+  log('останавливаюсь')
+  try { unlinkSync(SOCK) } catch {}
+  try { unlinkSync(join(STATE_DIR, 'router.pid')) } catch {}
+  try { unlinkSync(LOCK) } catch {}
+  setTimeout(() => process.exit(0), 2000)
+  void Promise.resolve(bot.stop()).finally(() => process.exit(0))
+}
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) process.on(sig, shutdown)
+process.on('unhandledRejection', e => log(`unhandled rejection: ${e}`))
+process.on('uncaughtException', e => log(`uncaught exception: ${e}`))
+
+for (let attempt = 1; !stopping; attempt++) {
+  try {
+    await bot.start({
+      onStart: info => {
+        attempt = 0; botUsername = info.username; log(`polling as @${info.username}`)
+        const cmds = [
+          { command: 'stop', description: 'Прервать текущее действие сессии (как Esc)' },
+          { command: 'screen', description: 'Браузер сессии: скриншот и кнопки управления' },
+          { command: 'windows', description: 'Окна сессий: открыть/скрыть кнопками' },
+          { command: 'show', description: 'Открыть окно сессии: /show <имя>' },
+          { command: 'hide', description: 'Скрыть окно сессии: /hide <имя>' },
+          { command: 'hideall', description: 'Скрыть все окна' },
+          { command: 'sessions', description: 'Список сессий и их состояние' },
+          { command: 'help', description: 'Что умеет бот' },
+        ]
+        for (const scope of [{ type: 'all_group_chats' as const }, { type: 'chat' as const, chat_id: Number(GROUP) }, { type: 'all_private_chats' as const }]) {
+          void bot.api.setMyCommands(cmds, { scope }).catch(e => log(`setMyCommands: ${e}`))
+        }
+      },
+    })
+    break
+  } catch (err) {
+    if (stopping) break
+    if (err instanceof Error && err.message === 'Aborted delay') break
+    const is409 = err instanceof GrammyError && err.error_code === 409
+    const delay = Math.min(1000 * attempt, 15000)
+    log(`${is409 ? '409 Conflict — другой процесс читает обновления бота' : `polling error: ${err}`}, повтор через ${delay / 1000}с`)
+    await new Promise(r => setTimeout(r, delay))
+  }
+}

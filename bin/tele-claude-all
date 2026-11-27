@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""
+Переводит все запущенные сессии Claude Code на tele_claude: у каждой своя тема в Telegram,
+контекст разговора сохраняется (перезапуск идёт через --resume <id сессии>).
+
+  tele-claude-all          — только показать план, ничего не трогать
+  tele-claude-all --go     — выполнить: корректно остановить старые сессии и запустить новые
+                             в фоне (tmux, по одной сессии tmux на проект)
+  tele-claude-all --attach — после --go открыть список запущенных tmux-сессий
+
+Посмотреть/зайти в сессию:  tmux attach -t tele-<имя>   (выйти, не закрывая: Ctrl+b, затем d)
+"""
+import os, re, subprocess, sys, time, glob, signal
+
+HOME = os.path.expanduser('~')
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LAUNCH = os.path.join(ROOT, 'bin', 'tele-claude')
+PROJECTS = os.path.join(HOME, '.claude', 'projects')
+SELF_PIDS = {os.getpid(), os.getppid()}
+
+
+def sh(*a):
+    return subprocess.run(a, capture_output=True, text=True).stdout
+
+
+def running_claude():
+    """[(pid, cwd, args)] для процессов claude (без самого CLI-помощника)."""
+    out = []
+    for line in sh('ps', '-axo', 'pid=,comm=,args=').splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 2 or os.path.basename(parts[1]) != 'claude':
+            continue
+        pid = int(parts[0]); args = parts[2] if len(parts) > 2 else ''
+        cwd = ''
+        for l in sh('lsof', '-a', '-p', str(pid), '-d', 'cwd', '-Fn').splitlines():
+            if l.startswith('n'):
+                cwd = l[1:]
+        if cwd and pid not in SELF_PIDS:
+            out.append((pid, cwd, args))
+    return out
+
+
+def project_dir(cwd):
+    return os.path.join(PROJECTS, re.sub(r'[^A-Za-z0-9]', '-', cwd))
+
+
+def newest_sessions(cwd):
+    files = glob.glob(os.path.join(project_dir(cwd), '*.jsonl'))
+    files.sort(key=os.path.getmtime, reverse=True)
+    return [os.path.basename(f)[:-6] for f in files]
+
+
+def plan():
+    procs = running_claude()
+    by_cwd = {}
+    rows = []
+    for pid, cwd, args in sorted(procs):
+        if 'server:tele' in args:
+            continue  # уже на новой схеме (эта сессия и похожие)
+        m = re.search(r'--resume\s+([0-9a-f-]{36})', args)
+        sid = m.group(1) if m else None
+        rows.append([pid, cwd, sid])
+    # у процессов без явного id берём самые свежие записи проекта, по одной на процесс
+    used = {r[2] for r in rows if r[2]}
+    for r in rows:
+        if r[2]:
+            continue
+        for s in newest_sessions(r[1]):
+            if s not in used:
+                r[2] = s; used.add(s); break
+    names = {}
+    out = []
+    for pid, cwd, sid in rows:
+        base = 'home' if cwd == HOME else os.path.basename(cwd)
+        n = names.get(base, 0) + 1; names[base] = n
+        name = base if n == 1 else f'{base}-{n}'
+        out.append(dict(pid=pid, cwd=cwd, sid=sid, tmux='tele-' + re.sub(r'[^A-Za-z0-9_-]', '_', name),
+                        topic_name='main' if n == 1 else f'сессия {n}'))
+    return out
+
+
+def main():
+    go = '--go' in sys.argv
+    items = plan()
+    if not items:
+        print('Нет запущенных сессий Claude Code для переноса.'); return
+    print(f'{"PID":>6}  {"сессия (id)":<38}  каталог')
+    for it in items:
+        print(f'{it["pid"]:>6}  {it["sid"] or "— нет записей, начнётся новая":<38}  {it["cwd"]}')
+    if not go:
+        print('\nЭто только план. Чтобы выполнить:  tele-claude-all --go')
+        return
+    if not sh('which', 'tmux').strip():
+        sys.exit('Нужен tmux: brew install tmux')
+
+    print('\nОстанавливаю старые сессии (SIGTERM — как Ctrl+C, история сохраняется)...')
+    for it in items:
+        try: os.kill(it['pid'], signal.SIGTERM)
+        except ProcessLookupError: pass
+    for _ in range(40):
+        alive = [it for it in items if subprocess.run(['kill', '-0', str(it['pid'])], capture_output=True).returncode == 0]
+        if not alive: break
+        time.sleep(0.5)
+    for it in alive:
+        print(f'  pid {it["pid"]} не завершился сам — пропускаю {it["cwd"]} (закройте вручную)')
+    items = [it for it in items if it not in alive]
+
+    print('Запускаю на новой схеме...')
+    for it in items:
+        resume = ['--resume', it['sid']] if it['sid'] else []
+        cmd = ' '.join([LAUNCH, shq(it['cwd'])] + (['--name', shq(it['topic_name'])] if it['topic_name'] != 'main' else []) + resume)
+        subprocess.run(['tmux', 'kill-session', '-t', it['tmux']], capture_output=True)
+        subprocess.run(['tmux', 'new-session', '-d', '-s', it['tmux'], '-x', '200', '-y', '50', cmd], check=True)
+    time.sleep(8)
+    for it in items:  # подтверждение вопроса про dev-канал: «1. I am using this for local development»
+        subprocess.run(['tmux', 'send-keys', '-t', it['tmux'], 'Enter'])
+        time.sleep(0.3)
+    print(f'\nГотово: запущено {len(items)}. В группе «Claude» появятся темы.')
+    print('Список:  tmux ls      Зайти:  tmux attach -t tele-<имя>   Выйти: Ctrl+b, затем d')
+
+
+def shq(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+main()

@@ -25,11 +25,13 @@ const HOME = homedir()
 const STATE_DIR = process.env.TELE_STATE_DIR ?? join(HOME, '.tele_claude')
 const SOCK = process.env.TELE_SOCK ?? join(STATE_DIR, 'router.sock')
 const CONFIG_FILE = join(STATE_DIR, 'config.json')
-const cfg0: { chat_id?: string; token_file?: string; access_file?: string; allow_from?: Array<string | number> } = (() => { try { return JSON.parse(readFileSync(CONFIG_FILE, 'utf8')) } catch { return {} } })()
+const cfg0: { chat_id?: string; token_file?: string; access_file?: string; projects_dir?: string; allow_from?: Array<string | number> } = (() => { try { return JSON.parse(readFileSync(CONFIG_FILE, 'utf8')) } catch { return {} } })()
 const expand = (p: string) => p.replace(/^~(?=\/|$)/, HOME)
 // Токен: ~/.tele_claude/.env (TELEGRAM_BOT_TOKEN=...) или другой файл из config.json (token_file).
 const TOKEN_FILE = process.env.TELE_TOKEN_FILE ?? expand(cfg0.token_file ?? join(STATE_DIR, '.env'))
 const ACCESS_FILE = process.env.TELE_ACCESS_FILE ?? (cfg0.access_file ? expand(cfg0.access_file) : '')
+const PROJECTS_DIR = process.env.TELE_NEW_ROOT ?? expand(cfg0.projects_dir ?? join(HOME, 'Documents', 'Projects'))
+const ROOT_DIR = join(import.meta.dir, '..')
 const SESSIONS_FILE = join(STATE_DIR, 'sessions.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const API_ROOT = process.env.TELE_API_ROOT // для тестов с поддельным Telegram
@@ -517,6 +519,9 @@ async function handleInbound(ctx: any, text: string, dl?: () => Promise<string |
   const isDm = chatType === 'private'
   if (!isGroup && !isDm) return
 
+  if (/^\/new(@\w+)?(\s|$)/i.test(text)) return void (await newCommand(Number(ctx.chat.id), tid))
+  if (!text.startsWith('/') && !att && !dl && newFlow?.awaitName && (tid ?? undefined) === newFlow.thread && await newFolderName(text)) return
+
   if (/^\/(stop|esc)(@\w+)?(\s|$)/i.test(text)) {
     const key = keyFor(tid)
     const opts = tid != null ? { message_thread_id: tid } : {}
@@ -633,6 +638,125 @@ function resolveWindow(arg: string, tid?: number): { name?: string; error?: stri
   const name = tmuxNameFor(s)
   return all.includes(name) ? { name } : { error: `У этой сессии нет tmux-окна (${name}). Она запущена не через tmux.` }
 }
+// ---------- /new: пошаговый запуск сессии в нужной папке ----------
+type NewFlow = { chat: number; thread?: number; dirs: string[]; dir?: string; awaitName?: boolean }
+let newFlow: NewFlow | undefined
+const shq = (x: string) => `'${x.replace(/'/g, `'\\''`)}'`
+const fmtDate = (ms: number) => new Date(ms).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
+
+function projectDirs(): string[] {
+  try {
+    return readdirSync(PROJECTS_DIR, { withFileTypes: true })
+      .filter(d => d.isDirectory() && !d.name.startsWith('.') && d.name !== 'node_modules')
+      .map(d => { const p = join(PROJECTS_DIR, d.name); const t = newestTranscript(p); let m = 0; try { if (t) m = statSync(t).mtimeMs } catch {}; return { p, m } })
+      .sort((a, b) => b.m - a.m || a.p.localeCompare(b.p))
+      .map(x => x.p)
+  } catch { return [] }
+}
+const isRunning = (dir: string) => teleTmuxSessions().includes(tmuxNameFor({ dir }))
+
+function newFolderPanel(page: number): { text: string; kb: InlineKeyboard } {
+  const f = newFlow!
+  f.dirs = projectDirs(); f.dir = undefined; f.awaitName = false
+  const per = 8, pages = Math.max(1, Math.ceil(f.dirs.length / per))
+  page = Math.min(Math.max(0, page), pages - 1)
+  const kb = new InlineKeyboard()
+  f.dirs.slice(page * per, page * per + per).forEach((d, i) => {
+    kb.text(`${isRunning(d) ? '🟢' : '📁'} ${d.split('/').pop()}`, `nw:d:${page * per + i}`)
+    if (i % 2 === 1) kb.row()
+  })
+  kb.row()
+  if (page > 0) kb.text('◀️', `nw:p:${page - 1}`)
+  kb.text(`${page + 1}/${pages}`, 'nw:p:' + page)
+  if (page < pages - 1) kb.text('▶️', `nw:p:${page + 1}`)
+  kb.row().text('➕ Создать новую папку', 'nw:c').text('✖️ Отмена', 'nw:x')
+  return { text: `Шаг 1. В какой папке запустить сессию?\n(папки из ${PROJECTS_DIR.replace(HOME, '~')}; 🟢 — уже запущена, сначала те, где недавно работали)`, kb }
+}
+
+function newModePanel(dir: string): { text: string; kb: InlineKeyboard } {
+  const kb = new InlineKeyboard()
+  const t = newestTranscript(dir)
+  let text = `Шаг 2. Папка ${dir.replace(HOME, '~')}.\n`
+  if (t) {
+    let m = 0; try { m = statSync(t).mtimeMs } catch {}
+    text += `Здесь уже была сессия (последняя работа ${fmtDate(m)}). Продолжить её с прежним контекстом или начать с нуля?`
+    kb.text('▶️ Продолжить прошлую', 'nw:s:r').row().text('🆕 Начать с нуля', 'nw:s:n')
+  } else {
+    text += 'Сессий здесь ещё не было. Запускаю новую?'
+    kb.text('🚀 Запустить', 'nw:s:n')
+  }
+  kb.row().text('◀️ Назад', 'nw:p:0').text('✖️ Отмена', 'nw:x')
+  return { text, kb }
+}
+
+async function newLaunch(dir: string, resume: boolean): Promise<string> {
+  const name = tmuxNameFor({ dir })
+  if (teleTmuxSessions().includes(name)) return `Сессия ${name} уже запущена. Её тема в группе; окно: /show ${name.replace(/^tele-/, '')}`
+  const t = newestTranscript(dir)
+  const sid = resume && t ? t.split('/').pop()!.replace(/\.jsonl$/, '') : ''
+  const cmd = `${shq(join(ROOT_DIR, 'bin', 'tele-claude'))} ${shq(dir)}${sid ? ' --resume ' + sid : ''}`
+  const r = tmux('new-session', '-d', '-s', name, '-x', '200', '-y', '50', '-c', dir, cmd)
+  if (r.status !== 0) return `Не получилось запустить: ${(r.stderr || '').trim().slice(0, 200)}`
+  await Bun.sleep(8000)
+  tmux('send-keys', '-t', name, 'Enter') // подтверждение вопроса про dev-канал
+  return `Запустил ${dir.replace(HOME, '~')}${sid ? ' (с прежним контекстом)' : ''}. Тема «${dir.split('/').pop()} — main» появится в группе через пару секунд. Окно: /show ${name.replace(/^tele-/, '')}`
+}
+
+async function newCommand(chat: number, thread?: number) {
+  newFlow = { chat, thread, dirs: [] }
+  const p = newFolderPanel(0)
+  await bot.api.sendMessage(chat, p.text, { ...withThread(thread), reply_markup: p.kb }).catch(() => {})
+}
+
+// Имя новой папки пришло текстом.
+async function newFolderName(text: string): Promise<boolean> {
+  const f = newFlow
+  if (!f?.awaitName) return false
+  const say = (t: string, extra: object = {}) => bot.api.sendMessage(f.chat, t, { ...withThread(f.thread), ...extra }).catch(() => {})
+  const name = text.trim()
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,60}$/.test(name)) { await say('Имя папки: латинские буквы, цифры, точка, дефис, подчёркивание, без пробелов. Напишите другое или нажмите «Отмена» в сообщении выше.'); return true }
+  const dir = join(PROJECTS_DIR, name)
+  if (existsSync(dir)) { await say(`Папка ${name} уже есть. Напишите другое имя.`); return true }
+  try { mkdirSync(dir, { recursive: true }) } catch (e) { await say(`Не смог создать папку: ${e}`); return true }
+  f.awaitName = false
+  await say(`Создал ${dir.replace(HOME, '~')}. Запускаю…`)
+  await say(await newLaunch(dir, false))
+  newFlow = undefined
+  return true
+}
+
+async function newCallback(ctx: any, d: string) {
+  const f = newFlow
+  const ans = (t?: string) => ctx.answerCallbackQuery({ text: t }).catch(() => {})
+  if (!f) return void (await ans('Начните заново: /new'))
+  const edit = (p: { text: string; kb: InlineKeyboard }) => ctx.editMessageText(p.text, { reply_markup: p.kb }).catch(() => {})
+  const [, act, arg] = d.split(':') as [string, string, string]
+  if (act === 'x') { newFlow = undefined; await ctx.editMessageText('Отменено.').catch(() => {}); return void (await ans()) }
+  if (act === 'p') { await edit(newFolderPanel(Number(arg))); return void (await ans()) }
+  if (act === 'c') {
+    f.awaitName = true
+    await ctx.editMessageText(`Шаг 2. Напишите имя новой папки одним сообщением (латиницей, без пробелов). Создам её в ${PROJECTS_DIR.replace(HOME, '~')} и запущу там сессию.`, { reply_markup: new InlineKeyboard().text('✖️ Отмена', 'nw:x') }).catch(() => {})
+    return void (await ans())
+  }
+  if (act === 'd') {
+    const dir = f.dirs[Number(arg)]
+    if (!dir) return void (await ans('Список устарел, начните заново: /new'))
+    if (isRunning(dir)) { await ctx.editMessageText(`${dir.replace(HOME, '~')}: сессия уже запущена, её тема в группе. Окно: /show ${tmuxNameFor({ dir }).replace(/^tele-/, '')}`).catch(() => {}); newFlow = undefined; return void (await ans()) }
+    f.dir = dir
+    await edit(newModePanel(dir)); return void (await ans())
+  }
+  if (act === 's' && f.dir) {
+    const dir = f.dir
+    await ctx.editMessageText(`Запускаю ${dir.replace(HOME, '~')}… (около 10 секунд)`).catch(() => {})
+    await ans('Запускаю')
+    const msg = await newLaunch(dir, arg === 'r')
+    newFlow = undefined
+    await bot.api.sendMessage(f.chat, msg, withThread(f.thread)).catch(() => {})
+    return
+  }
+  await ans()
+}
+
 // ---------- управление вкладкой Chrome через Telegram ----------
 const BROWSER_ACTIONS: Record<string, [string, string]> = {
   shot: ['📸 Скриншот', 'Сделай скриншот текущей вкладки в Chrome'],
@@ -725,7 +849,7 @@ async function serviceCommand(ctx: any, text: string, tid?: number) {
       : 'Сессий пока нет.'
     await bot.api.sendMessage(chatId, lines + '\n\n🟢 запущена, ⚪️ не запущена', opts)
   } else {
-    await bot.api.sendMessage(chatId, 'У каждой сессии Claude Code своя тема. Пишите в тему, и сообщение попадёт только в эту сессию.\n\n/windows — окна кнопками\n/sessions — список сессий\n/show <имя> — открыть окно терминала с сессией (в теме сессии имя не нужно)\n/hide <имя> — скрыть окно, сессия продолжит работать\n/hideall — скрыть все окна', opts)
+    await bot.api.sendMessage(chatId, 'У каждой сессии Claude Code своя тема. Пишите в тему, и сообщение попадёт только в эту сессию.\n\n/new — запустить сессию в нужной папке (по шагам)\n/windows — окна кнопками\n/sessions — список сессий\n/show <имя> — открыть окно терминала с сессией (в теме сессии имя не нужно)\n/hide <имя> — скрыть окно, сессия продолжит работать\n/hideall — скрыть все окна', opts)
   }
 }
 
@@ -765,6 +889,10 @@ bot.on('callback_query:data', async ctx => {
     const ref = ctx.callbackQuery.data.slice(5)
     const key = keyFor(ref === 'g' ? undefined : Number(ref))
     return void ctx.answerCallbackQuery({ text: key && clients.has(key) ? interrupt(key) : 'Сессия не запущена' }).catch(() => {})
+  }
+  if (ctx.callbackQuery.data.startsWith('nw:')) {
+    if (!isAllowed(ctx.from.id)) return void ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    return void (await newCallback(ctx, ctx.callbackQuery.data))
   }
   if (ctx.callbackQuery.data.startsWith('ask:')) {
     if (!isAllowed(ctx.from.id)) return void ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
@@ -845,6 +973,7 @@ for (let attempt = 1; !stopping; attempt++) {
       onStart: info => {
         attempt = 0; botUsername = info.username; log(`polling as @${info.username}`)
         const cmds = [
+          { command: 'new', description: 'Запустить новую сессию: выбрать или создать папку' },
           { command: 'stop', description: 'Прервать текущее действие сессии (как Esc)' },
           { command: 'screen', description: 'Браузер сессии: скриншот и кнопки управления' },
           { command: 'windows', description: 'Окна сессий: открыть/скрыть кнопками' },

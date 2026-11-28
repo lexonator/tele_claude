@@ -49,13 +49,14 @@ beforeAll(async () => {
       }
     },
   })
+  mkdirSync(join(dir, 'proj', 'alpha'), { recursive: true })
   writeFileSync(join(dir, 'config.json'), JSON.stringify({ chat_id: GROUP }))
   writeFileSync(join(dir, 'access.json'), JSON.stringify({ allowFrom: [String(USER)] }))
   router = Bun.spawn(['bun', join(import.meta.dir, '../router/router.ts')], {
     env: {
       ...process.env,
       TELE_STATE_DIR: dir, TELE_BOT_TOKEN: 'TEST:TOKEN', TELE_API_ROOT: `http://localhost:${fake.port}`,
-      TELE_ACCESS_FILE: join(dir, 'access.json'), TELE_PROJECTS_DIR: join(dir, 'projects'),
+      TELE_NEW_ROOT: join(dir, 'proj'), TELE_ACCESS_FILE: join(dir, 'access.json'), TELE_PROJECTS_DIR: join(dir, 'projects'),
     },
     stderr: process.env.DEBUG_ROUTER ? 'inherit' : 'ignore',
   })
@@ -186,4 +187,22 @@ test('вопрос с выбором (AskUserQuestion) приходит в те�
   expect(m.body.message_thread_id).toBe(r.result.thread_id)
   const kb = JSON.stringify(m.body.reply_markup)
   expect(kb).toContain('Первое'); expect(kb).toContain('Другое')
+})
+
+test('/new: показывает папки, просит имя новой и не принимает плохое имя', async () => {
+  calls.length = 0
+  updates.push(fakeUpdate('/new'))
+  await Bun.sleep(700)
+  const m = calls.find(x => x.method === 'sendMessage' && String(x.body.text).includes('Шаг 1'))!
+  expect(m).toBeTruthy()
+  const kb = JSON.stringify(m.body.reply_markup)
+  expect(kb).toContain('alpha'); expect(kb).toContain('Создать новую папку')
+  updates.push({ update_id: 7, callback_query: { id: 'c1', chat_instance: 'x', data: 'nw:c', from: { id: USER, is_bot: false, first_name: 'u' },
+    message: { message_id: 5, date: 1, chat: { id: Number(GROUP), type: 'supergroup' }, text: 'x' } } })
+  await Bun.sleep(600)
+  calls.length = 0
+  updates.push(fakeUpdate('плохое имя с пробелами'))
+  await Bun.sleep(700)
+  expect(calls.some(x => x.method === 'sendMessage' && String(x.body.text).includes('латинские буквы'))).toBe(true)
+  expect(existsSync(join(dir, 'proj', 'плохое имя с пробелами'))).toBe(false)
 })

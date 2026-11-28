@@ -237,7 +237,8 @@ function watchTranscript(key: string): ReturnType<typeof setInterval> {
         const msg = e?.message
         if (e?.type === 'assistant' && Array.isArray(msg?.content)) {
           for (const b of msg.content) {
-            if (b.type === 'tool_use') { const d = describeTool(b.name, b.input); if (d) actSet(key, d) }
+            if (b.type === 'tool_use' && b.name === 'AskUserQuestion') { actSet(key, '❓ Жду вашего ответа'); askShow(key, String(b.id), b.input) }
+            else if (b.type === 'tool_use') { const d = describeTool(b.name, b.input); if (d) actSet(key, d) }
             else if (b.type === 'thinking' && b.thinking) actSet(key, '💭 ' + String(b.thinking).replace(/\s+/g, ' ').trim().slice(-240))
           }
           if (msg.stop_reason === 'end_turn') actStop(key)
@@ -245,6 +246,7 @@ function watchTranscript(key: string): ReturnType<typeof setInterval> {
           actStop(key) // ход прерван (Esc)
         } else if (e?.type === 'user' && Array.isArray(msg?.content) && msg.content.some((b: any) => b.type === 'tool_result')) {
           // результат инструмента получен — модель снова думает (если не пришло ничего нового, строка останется как есть)
+          for (const b of msg.content) if (b.type === 'tool_result') askDone(String(b.tool_use_id))
         }
       }
     } catch {}
@@ -258,6 +260,78 @@ function actStop(key: string) {
   clearInterval(a.typing); clearTimeout(a.kill); if (a.watch) clearInterval(a.watch)
   if (a.msgId != null && a.msgId > 0) void bot.api.deleteMessage(GROUP, a.msgId).catch(() => {})
   if (statusMsgs[key] != null) { delete statusMsgs[key]; saveStatus() }
+}
+
+// ---------- вопросы с выбором (AskUserQuestion): показываем кнопками, выбор жмём в терминале ----------
+type AskQ = { question?: string; header?: string; multiSelect?: boolean; options?: Array<{ label?: string; description?: string }> }
+type Ask = { key: string; toolId: string; thread?: number; q: AskQ; msgId?: number; other?: boolean }
+const asks = new Map<number, Ask>()
+let askSeq = 0
+
+function askShow(key: string, toolId: string, input: any) {
+  const qs: AskQ[] = Array.isArray(input?.questions) ? input.questions : []
+  if (!qs.length) return
+  const thread = threadForKey(key)
+  const fmt = (q: AskQ) => `❓ ${q.header ? q.header + '\n' : ''}${q.question ?? ''}\n\n` +
+    (q.options ?? []).map((o, i) => `${i + 1}. ${o.label ?? ''}${o.description ? ' — ' + o.description : ''}`).join('\n')
+  if (qs.length !== 1 || qs[0]!.multiSelect) {
+    // сложные формы (несколько вопросов или множественный выбор) кнопками пока не поддерживаем
+    const text = qs.map(fmt).join('\n\n———\n\n') + '\n\nОтветьте в окне сессии: /show'
+    void bot.api.sendMessage(GROUP, text.slice(0, 4000), withThread(thread)).catch(() => {})
+    return
+  }
+  const q = qs[0]!
+  const id = ++askSeq
+  const ask: Ask = { key, toolId, thread, q }
+  asks.set(id, ask)
+  const kb = new InlineKeyboard()
+  ;(q.options ?? []).forEach((o, i) => kb.text(`${i + 1}. ${(o.label ?? '').slice(0, 50)}`, `ask:${id}:${i}`).row())
+  kb.text('✍️ Другое (напишу текстом)', `ask:${id}:${(q.options ?? []).length}`)
+  void bot.api.sendMessage(GROUP, fmt(q).slice(0, 4000), { ...withThread(thread), reply_markup: kb })
+    .then(m => { ask.msgId = m.message_id }).catch(e => log(`вопрос: не отправился: ${e}`))
+}
+
+// Ответили (в терминале или кнопкой): убираем кнопки.
+function askDone(toolId: string, note = '✅ Отвечено') {
+  for (const [id, a] of asks) {
+    if (a.toolId !== toolId) continue
+    asks.delete(id)
+    if (a.msgId != null) void bot.api.editMessageReplyMarkup(GROUP, a.msgId, { reply_markup: new InlineKeyboard() }).catch(() => {})
+    if (a.msgId != null) void bot.api.sendMessage(GROUP, note, { ...withThread(a.thread), reply_to_message_id: a.msgId, disable_notification: true }).catch(() => {})
+  }
+}
+
+// Нажали кнопку: проверяем, что вопрос ещё на экране, и жмём стрелки + Enter в tmux-окне.
+function askPress(id: number, idx: number): string {
+  const a = asks.get(id)
+  if (!a) return 'Вопрос уже закрыт'
+  const name = tmuxNameFor({ dir: a.key.split('::')[0]! })
+  if (!teleTmuxSessions().includes(name)) return 'У сессии нет tmux-окна, ответьте в терминале'
+  const squash = (x: string) => x.replace(/\s+/g, '')
+  const screen = squash(tmux('capture-pane', '-p', '-t', name).stdout ?? '')
+  const probe = squash(a.q.options?.[0]?.label ?? a.q.question ?? '').slice(0, 15)
+  if (!probe || !screen.includes(probe)) return 'Вопрос уже не на экране'
+  const n = a.q.options?.length ?? 0
+  const keys = [...Array(Math.min(idx, n)).fill('Down'), 'Enter']
+  tmux('send-keys', '-t', name, ...keys)
+  if (idx >= n) { a.other = true; return 'Напишите ответ следующим сообщением' }
+  askDone(a.toolId, `✅ Выбрано: ${a.q.options![idx]!.label ?? idx + 1}`)
+  return 'Выбрано'
+}
+
+// Следующее сообщение после «Другое» — это текст ответа.
+function askText(key: string, text: string): boolean {
+  for (const [id, a] of asks) {
+    if (a.key !== key || !a.other) continue
+    const name = tmuxNameFor({ dir: key.split('::')[0]! })
+    if (!teleTmuxSessions().includes(name)) return false
+    tmux('send-keys', '-t', name, '-l', text)
+    tmux('send-keys', '-t', name, 'Enter')
+    asks.delete(id)
+    if (a.msgId != null) void bot.api.editMessageReplyMarkup(GROUP, a.msgId, { reply_markup: new InlineKeyboard() }).catch(() => {})
+    return true
+  }
+  return false
 }
 
 // ---------- обработка запросов клиента ----------
@@ -468,6 +542,7 @@ async function handleInbound(ctx: any, text: string, dl?: () => Promise<string |
     if (/^\/(sessions|help|start)(@\w+)?\b/.test(text)) return void (await serviceCommand(ctx, text, tid))
     // обычное сообщение в General — главной сессии
     if (isGroup && tid == null && generalKey && clients.has(generalKey)) {
+      if (!att && !dl && askText(generalKey, text)) return
       actStart(generalKey)
       const imagePath = dl ? await dl() : undefined
       pushTo(generalKey, {
@@ -508,6 +583,7 @@ async function handleInbound(ctx: any, text: string, dl?: () => Promise<string |
     return
   }
 
+  if (!att && !dl && askText(s.key, text)) return
   actStart(s.key)
   const imagePath = dl ? await dl() : undefined
   pushTo(s.key, {
@@ -689,6 +765,11 @@ bot.on('callback_query:data', async ctx => {
     const ref = ctx.callbackQuery.data.slice(5)
     const key = keyFor(ref === 'g' ? undefined : Number(ref))
     return void ctx.answerCallbackQuery({ text: key && clients.has(key) ? interrupt(key) : 'Сессия не запущена' }).catch(() => {})
+  }
+  if (ctx.callbackQuery.data.startsWith('ask:')) {
+    if (!isAllowed(ctx.from.id)) return void ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    const [, id, idx] = ctx.callbackQuery.data.split(':') as [string, string, string]
+    return void ctx.answerCallbackQuery({ text: askPress(Number(id), Number(idx)) }).catch(() => {})
   }
   if (ctx.callbackQuery.data.startsWith('br:')) {
     if (!isAllowed(ctx.from.id)) return void ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})

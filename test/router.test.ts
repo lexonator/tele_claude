@@ -169,3 +169,21 @@ test('статус: читает журнал сессии, показывает
   await Bun.sleep(1500)
   expect(calls.some(x => x.method === 'deleteMessage')).toBe(true)
 })
+
+test('вопрос с выбором (AskUserQuestion) приходит в тему кнопками', async () => {
+  const c = await TestClient.open()
+  const r = await c.call({ op: 'register', key: '/p/q::main', name: 'main', dir: '/p/q' })
+  const pd = join(dir, 'projects', '-p-q'); mkdirSync(pd, { recursive: true })
+  const tr = join(pd, 's1.jsonl'); writeFileSync(tr, '')
+  updates.push(fakeUpdate('спроси меня', r.result.thread_id))
+  await c.waitEvent()
+  calls.length = 0
+  const input = { questions: [{ question: 'Что делать?', header: 'Выбор', multiSelect: false, options: [{ label: 'Первое', description: 'a' }, { label: 'Второе' }] }] }
+  appendFileSync(tr, JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu1', name: 'AskUserQuestion', input }] } }) + '\n')
+  await Bun.sleep(2500)
+  const m = calls.find(x => x.method === 'sendMessage' && String(x.body.text).includes('Что делать?'))!
+  expect(m).toBeTruthy()
+  expect(m.body.message_thread_id).toBe(r.result.thread_id)
+  const kb = JSON.stringify(m.body.reply_markup)
+  expect(kb).toContain('Первое'); expect(kb).toContain('Другое')
+})

@@ -891,7 +891,7 @@ async function newCallback(ctx: any, d: string) {
 // Ход, начатый из Telegram, уже виден в теме (ответ идёт через reply), поэтому дублируем только то, что набрано в терминале.
 const MIRROR_OFF = join(STATE_DIR, 'mirror.off')
 const mirrorOn = () => !existsSync(MIRROR_OFF)
-type Mir = { file?: string; offset: number; rest: string; mode: 'tg' | 'term' }
+type Mir = { file?: string; offset: number; rest: string; mode: 'tg' | 'term'; replied?: boolean }
 const mirrors = new Map<string, Mir>()
 const mirrorQueue: Array<{ key: string; thread?: number; text: string }> = []
 setInterval(() => {
@@ -943,11 +943,14 @@ function mirrorTick() {
           if (!t) continue
           if (t.includes('<channel source=')) { m.mode = 'tg'; continue }
           if (t.startsWith('<') || t.startsWith('[Request interrupted') || t.startsWith('Caveat:')) continue
-          m.mode = 'term'
+          m.mode = 'term'; m.replied = false
           mirrorSend(key, `🖥 Из терминала:\n${t}`)
           actStart(key)
         } else if (e?.type === 'assistant' && m.mode === 'term' && Array.isArray(e.message?.content)) {
-          for (const b of e.message.content) if (b?.type === 'text' && String(b.text ?? '').trim()) mirrorSend(key, `🤖 ${String(b.text).trim()}`)
+          // Ответ через reply уже виден в теме; промежуточные пояснения («сейчас посмотрю…») не дублируем — только итоговый текст хода.
+          if (e.message.content.some((b: any) => b?.type === 'tool_use' && /^mcp__tele__/.test(String(b.name)))) m.replied = true
+          if (e.message?.stop_reason === 'end_turn' && !m.replied)
+            for (const b of e.message.content) if (b?.type === 'text' && String(b.text ?? '').trim()) mirrorSend(key, `🤖 ${String(b.text).trim()}`)
         }
       }
       if (busy && !activity.has(key)) actStart(key, what ?? '💭 Думаю…')

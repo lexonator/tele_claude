@@ -219,13 +219,15 @@ test('зеркало: набранное в терминале дублируе�
   const tr = join(pd, 's1.jsonl'); writeFileSync(tr, '')
   await Bun.sleep(2200) // первое знакомство с журналом
   calls.length = 0
-  const A = (text: string) => JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text }] } }) + '\n'
+  const A = (text: string, extra: any[] = []) => JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text }, ...extra], stop_reason: 'end_turn' } }) + '\n'
+  const N = (text: string) => JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text }, { type: 'tool_use', name: 'Read', input: {} }], stop_reason: 'tool_use' } }) + '\n'
   const U = (text: string) => JSON.stringify({ type: 'user', message: { content: text } }) + '\n'
-  appendFileSync(tr, U('привет из терминала') + A('ответ в терминале'))
+  appendFileSync(tr, U('привет из терминала') + N('сейчас посмотрю файл') + A('ответ в терминале'))
   await Bun.sleep(4500)
   const texts = () => calls.filter(x => x.method === 'sendMessage').map(x => String(x.body.text))
   expect(texts().some(t => t.includes('привет из терминала'))).toBe(true)
   expect(texts().some(t => t.includes('ответ в терминале'))).toBe(true)
+  expect(texts().some(t => t.includes('сейчас посмотрю'))).toBe(false)
   expect(calls.find(x => x.method === 'sendMessage' && String(x.body.text).includes('привет из'))!.body.message_thread_id).toBe(r.result.thread_id)
   calls.length = 0
   appendFileSync(tr, U('<channel source="tele" chat_id="1">из телеги</channel>') + A('этот ответ уже ушёл через reply'))

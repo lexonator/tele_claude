@@ -58,7 +58,7 @@ function allowedUsers(): string[] {
   try { return (JSON.parse(readFileSync(ACCESS_FILE, 'utf8')).allowFrom ?? []).map(String) } catch { return [] }
 }
 
-type Session = { key: string; name: string; dir: string; thread_id: number; created: number }
+type Session = { key: string; name: string; dir: string; thread_id: number; created: number; title?: string; model?: string; local?: boolean }
 let sessions: Record<string, Session> = {}
 try { sessions = JSON.parse(readFileSync(SESSIONS_FILE, 'utf8')) } catch {}
 function saveSessions() {
@@ -96,10 +96,15 @@ function threadOf(c: Client): number | undefined {
   return s.thread_id
 }
 
-function topicTitle(s: { name: string; dir: string }) {
+// Название темы: своё (после /rename или ручного переименования) или имя папки, плюс «· модель».
+function baseTitle(s: { name: string; dir: string; title?: string }) {
   const project = s.dir.split('/').filter(Boolean).pop() ?? 'session'
-  return `${project} — ${s.name}`.slice(0, 128)
+  return s.title ?? (s.name === 'main' ? project : `${project} — ${s.name}`)
 }
+function topicTitle(s: { name: string; dir: string; title?: string; model?: string }) {
+  return (s.model ? `${baseTitle(s)} · ${s.model}` : baseTitle(s)).slice(0, 128)
+}
+const stripModel = (t: string) => t.replace(/ · [^·]+$/, '')
 
 async function ensureTopic(key: string, name: string, dir: string): Promise<Session> {
   const existing = sessions[key]
@@ -523,11 +528,20 @@ async function handleInbound(ctx: any, text: string, dl?: () => Promise<string |
   if (rn) {
     const say = (t: string) => bot.api.sendMessage(GROUP, t, withThread(tid)).catch(() => {})
     if (tid == null) return void (await say('Переименовать можно тему сессии: напишите /rename Новое название внутри неё. Общую тему General Telegram переименовать не даёт.'))
-    const title = rn[2]!.trim().slice(0, 128)
-    try { await bot.api.editForumTopic(GROUP, tid, { name: title }); return void (await say(`Переименовал: «${title}»`)) }
+    const title = stripModel(rn[2]!.trim()).slice(0, 100)
+    const ses = sessionByThread(tid)
+    if (ses) { sessions[ses.key]!.title = title; saveSessions() }
+    const full = ses ? topicTitle(sessions[ses.key]!) : title
+    try { await bot.api.editForumTopic(GROUP, tid, { name: full }); return void (await say(`Переименовал: «${full}»`)) }
     catch (e) { return void (await say(`Не получилось переименовать: ${e}`)) }
   }
   if (/^\/rename(@\w+)?\s*$/i.test(text.trim())) return void (await bot.api.sendMessage(GROUP, 'Напишите новое название: /rename Новое название. Или переименуйте тему вручную (нажмите на название темы сверху → «Изменить»): бот это название не трогает.', withThread(tid)).catch(() => {}))
+  if (/^\/model(@\w+)?(\s|$)/i.test(text)) {
+    const key = keyFor(tid)
+    if (!key || !clients.has(key)) return void (await bot.api.sendMessage(GROUP, 'Для этой темы нет запущенной сессии.', withThread(tid)).catch(() => {}))
+    const p = modelPanel(key, Number(ctx.chat.id), tid)
+    return void (await bot.api.sendMessage(GROUP, p.text, { ...withThread(tid), reply_markup: p.kb }).catch(() => {}))
+  }
   if (/^\/new(@\w+)?(\s|$)/i.test(text)) return void (await newCommand(Number(ctx.chat.id), tid))
   if (!text.startsWith('/') && !att && !dl && newFlow?.awaitName && (tid ?? undefined) === newFlow.thread && await newFolderName(text)) return
 
@@ -698,12 +712,16 @@ function newModePanel(dir: string): { text: string; kb: InlineKeyboard } {
   return { text, kb }
 }
 
-async function newLaunch(dir: string, resume: boolean): Promise<string> {
+async function newLaunch(dir: string, resume: boolean, o: { model?: string; local?: boolean; key?: string } = {}): Promise<string> {
   const name = tmuxNameFor({ dir })
   if (teleTmuxSessions().includes(name)) return `Сессия ${name} уже запущена. Её тема в группе; окно: /show ${name.replace(/^tele-/, '')}`
   const t = newestTranscript(dir)
   const sid = resume && t ? t.split('/').pop()!.replace(/\.jsonl$/, '') : ''
-  const cmd = `${shq(join(ROOT_DIR, 'bin', 'tele-claude'))} ${shq(dir)}${sid ? ' --resume ' + sid : ''}`
+  const sname = o.key?.split('::')[1]
+  const env = o.local && o.model
+    ? `env ANTHROPIC_BASE_URL=http://127.0.0.1:11434 ANTHROPIC_AUTH_TOKEN=ollama ANTHROPIC_API_KEY= ANTHROPIC_CUSTOM_MODEL_OPTION=${shq(o.model)} ANTHROPIC_CUSTOM_MODEL_OPTION_NAME=${shq(o.model)} ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES=thinking ANTHROPIC_DEFAULT_SONNET_MODEL=${shq(o.model)} ANTHROPIC_DEFAULT_OPUS_MODEL=${shq(o.model)} ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen-fast:latest CLAUDE_CODE_SUBAGENT_MODEL=qwen-fast:latest CLAUDE_CODE_MAX_CONTEXT_TOKENS=65536 DISABLE_AUTOUPDATER=1 `
+    : ''
+  const cmd = `${env}${shq(join(ROOT_DIR, 'bin', 'tele-claude'))} ${shq(dir)}${sname && sname !== 'main' ? ' --name ' + shq(sname) : ''}${o.key && o.key === generalKey ? ' --main' : ''}${sid ? ' --resume ' + sid : ''}${o.model ? ' --model ' + shq(o.model) : ''}`
   const r = tmux('new-session', '-d', '-s', name, '-x', '200', '-y', '50', '-c', dir, cmd)
   if (r.status !== 0) return `Не получилось запустить: ${(r.stderr || '').trim().slice(0, 200)}`
   // Отвечаем на стартовые вопросы Claude Code по тому, что видно на экране (вслепую Enter мог выбрать «Нет, выйти»).
@@ -773,6 +791,102 @@ async function newCallback(ctx: any, d: string) {
     return
   }
   await ans()
+}
+
+// ---------- модель сессии: подпись в названии темы и команда /model ----------
+function modelShort(id: string): string {
+  const m = /^claude-([a-z]+)-(\d+)(?:-(\d+))?/.exec(id)
+  if (m) return `${m[1]![0]!.toUpperCase()}${m[1]!.slice(1)} ${m[2]}${m[3] ? '.' + m[3] : ''}`
+  return id.replace(/^.*\//, '').split(':')[0]!
+}
+function readModel(dir: string): string | undefined {
+  const f = newestTranscript(dir)
+  if (!f) return undefined
+  try {
+    const size = statSync(f).size, len = Math.min(size, 300_000)
+    const fd = openSync(f, 'r'); const buf = Buffer.alloc(len); readSync(fd, buf, 0, len, size - len); closeSync(fd)
+    const all = [...buf.toString('utf8').matchAll(/"model":"([^"]+)"/g)].map(x => x[1]!).filter(x => !x.startsWith('<'))
+    return all[all.length - 1]
+  } catch { return undefined }
+}
+const renameQueue: string[] = []
+function queueRename(key: string) { if (!renameQueue.includes(key)) renameQueue.push(key) }
+setInterval(() => {
+  const key = renameQueue.shift()
+  const s = key ? sessions[key] : undefined
+  if (!key || !s || clients.get(key)?.general) return
+  bot.api.editForumTopic(GROUP, s.thread_id, { name: topicTitle(s) }).catch(e => {
+    const m = /retry after (\d+)/.exec(String(e))
+    if (m) { renameQueue.unshift(key); setTimeout(() => {}, 0) }
+    else if (!/NOT_MODIFIED/.test(String(e))) log(`переименование темы: ${e}`)
+  })
+}, 2500)
+function refreshModels() {
+  for (const key of clients.keys()) {
+    const s = sessions[key]
+    if (!s || clients.get(key)?.general) continue
+    const id = readModel(s.dir)
+    if (!id) continue
+    const short = modelShort(id)
+    if (s.model !== short) { s.model = short; s.local = !id.startsWith('claude'); saveSessions(); queueRename(key) }
+  }
+}
+setInterval(refreshModels, 20_000)
+setTimeout(refreshModels, 8_000)
+
+// Если название темы поменял человек, запоминаем его как основное (без подписи модели).
+bot.on('message:forum_topic_edited', ctx => {
+  const name = ctx.message.forum_topic_edited?.name
+  const tid = ctx.message.message_thread_id
+  if (!name || tid == null || ctx.from?.is_bot) return
+  const ses = sessionByThread(tid)
+  if (ses) { sessions[ses.key]!.title = stripModel(name); saveSessions() }
+})
+
+type ModelOpt = { label: string; id: string; local: boolean }
+let modelFlow: { key: string; chat: number; thread?: number; opts: ModelOpt[] } | undefined
+const CLOUD_MODELS: ModelOpt[] = [
+  { label: 'Opus 5.5', id: 'claude-opus-5-5', local: false },
+  { label: 'Sonnet 5.5', id: 'claude-sonnet-5-5', local: false },
+  { label: 'Haiku 5.5', id: 'claude-haiku-5-5', local: false },
+  { label: 'Fable 5.2', id: 'claude-fable-5-2', local: false },
+]
+function localModels(): ModelOpt[] {
+  const r = spawnSync('ollama', ['list'], { encoding: 'utf8', env: { ...process.env, PATH: `${process.env.PATH}:/opt/homebrew/bin:/usr/local/bin` } })
+  if (r.status !== 0) return []
+  return r.stdout.split('\n').slice(1).map(l => l.split(/\s+/)[0]!).filter(Boolean).map(id => ({ label: id.replace(/^.*\//, ''), id, local: true }))
+}
+function modelPanel(key: string, chat: number, thread?: number): { text: string; kb: InlineKeyboard } {
+  const s = sessions[key]
+  const opts = [...CLOUD_MODELS, ...localModels()]
+  modelFlow = { key, chat, thread, opts }
+  const kb = new InlineKeyboard()
+  opts.forEach((o, i) => { kb.text(`${o.local ? '🏠' : '☁️'} ${o.label}`, `md:${i}`); if (i % 2 === 1 || i === CLOUD_MODELS.length - 1) kb.row() })
+  kb.row().text('✖️ Отмена', 'md:x')
+  const cur = s?.model ? `${s.local ? '🏠' : '☁️'} ${s.model}` : 'пока неизвестна (появится после первого ответа)'
+  return { text: `Модель этой сессии: ${cur}.\n\n☁️ Claude: переключается на лету командой /model в окне сессии (лучше, когда сессия не занята).\n🏠 Локальные (Ollama) и возврат с локальной на Claude: сессия перезапускается с тем же контекстом, около 15 секунд.`, kb }
+}
+
+async function modelSwitch(opt: ModelOpt): Promise<string> {
+  const f = modelFlow!
+  const s = sessions[f.key]
+  const dir = f.key.split('::')[0]!
+  const name = tmuxNameFor({ dir })
+  if (!teleTmuxSessions().includes(name)) return 'У сессии нет tmux-окна. Запустите её через /new.'
+  if (!opt.local && !s?.local) {
+    tmux('send-keys', '-t', name, '-l', `/model ${opt.id}`); tmux('send-keys', '-t', name, 'Enter')
+    if (s) { s.model = modelShort(opt.id); saveSessions(); queueRename(f.key) }
+    return `Отправил в окно: /model ${opt.id}. Если сессия была занята, команда сработает после ответа.`
+  }
+  if (opt.local && spawnSync('curl', ['-sf', '-m', '3', 'http://127.0.0.1:11434/api/version']).status !== 0) {
+    spawnSync('open', ['-a', 'Ollama']); await Bun.sleep(6000)
+    if (spawnSync('curl', ['-sf', '-m', '3', 'http://127.0.0.1:11434/api/version']).status !== 0) return 'Ollama не отвечает. Запустите приложение Ollama и повторите.'
+  }
+  tmux('kill-session', '-t', name)
+  await Bun.sleep(1500)
+  const msg = await newLaunch(dir, true, { model: opt.id, local: opt.local, key: f.key })
+  if (s) { s.model = modelShort(opt.id); s.local = opt.local; saveSessions(); queueRename(f.key) }
+  return msg
 }
 
 // ---------- управление вкладкой Chrome через Telegram ----------
@@ -867,7 +981,7 @@ async function serviceCommand(ctx: any, text: string, tid?: number) {
       : 'Сессий пока нет.'
     await bot.api.sendMessage(chatId, lines + '\n\n🟢 запущена, ⚪️ не запущена', opts)
   } else {
-    await bot.api.sendMessage(chatId, 'У каждой сессии Claude Code своя тема. Пишите в тему, и сообщение попадёт только в эту сессию.\n\n/rename <название> — переименовать тему\n/new — запустить сессию в нужной папке (по шагам)\n/windows — окна кнопками\n/sessions — список сессий\n/show <имя> — открыть окно терминала с сессией (в теме сессии имя не нужно)\n/hide <имя> — скрыть окно, сессия продолжит работать\n/hideall — скрыть все окна', opts)
+    await bot.api.sendMessage(chatId, 'У каждой сессии Claude Code своя тема. Пишите в тему, и сообщение попадёт только в эту сессию.\n\n/model — сменить модель (Claude или локальная)\n/rename <название> — переименовать тему\n/new — запустить сессию в нужной папке (по шагам)\n/windows — окна кнопками\n/sessions — список сессий\n/show <имя> — открыть окно терминала с сессией (в теме сессии имя не нужно)\n/hide <имя> — скрыть окно, сессия продолжит работать\n/hideall — скрыть все окна', opts)
   }
 }
 
@@ -907,6 +1021,19 @@ bot.on('callback_query:data', async ctx => {
     const ref = ctx.callbackQuery.data.slice(5)
     const key = keyFor(ref === 'g' ? undefined : Number(ref))
     return void ctx.answerCallbackQuery({ text: key && clients.has(key) ? interrupt(key) : 'Сессия не запущена' }).catch(() => {})
+  }
+  if (ctx.callbackQuery.data.startsWith('md:')) {
+    if (!isAllowed(ctx.from.id)) return void ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    const arg = ctx.callbackQuery.data.slice(3)
+    const f = modelFlow
+    if (arg === 'x' || !f) { modelFlow = undefined; await ctx.editMessageText('Отменено.').catch(() => {}); return void ctx.answerCallbackQuery().catch(() => {}) }
+    const opt = f.opts[Number(arg)]
+    if (!opt) return void ctx.answerCallbackQuery({ text: 'Список устарел, /model заново' }).catch(() => {})
+    modelFlow = undefined
+    await ctx.answerCallbackQuery({ text: 'Переключаю…' }).catch(() => {})
+    await ctx.editMessageText(`Переключаю на ${opt.label}…`).catch(() => {})
+    const msg = await modelSwitch(opt)
+    return void (await bot.api.sendMessage(GROUP, msg, withThread(f.thread)).catch(() => {}))
   }
   if (ctx.callbackQuery.data.startsWith('nw:')) {
     if (!isAllowed(ctx.from.id)) return void ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
@@ -975,9 +1102,9 @@ function shutdown() {
   if (stopping) return
   stopping = true
   log('останавливаюсь')
-  try { unlinkSync(SOCK) } catch {}
-  try { unlinkSync(join(STATE_DIR, 'router.pid')) } catch {}
-  try { unlinkSync(LOCK) } catch {}
+  try { if (parseInt(readFileSync(join(STATE_DIR, 'router.pid'), 'utf8'), 10) === process.pid) unlinkSync(SOCK) } catch {}
+  try { if (parseInt(readFileSync(join(STATE_DIR, 'router.pid'), 'utf8'), 10) === process.pid) unlinkSync(join(STATE_DIR, 'router.pid')) } catch {}
+  try { if (parseInt(readFileSync(LOCK, 'utf8'), 10) === process.pid) unlinkSync(LOCK) } catch {}
   setTimeout(() => process.exit(0), 2000)
   void Promise.resolve(bot.stop()).finally(() => process.exit(0))
 }
@@ -991,6 +1118,7 @@ for (let attempt = 1; !stopping; attempt++) {
       onStart: info => {
         attempt = 0; botUsername = info.username; log(`polling as @${info.username}`)
         const cmds = [
+          { command: 'model', description: 'Сменить модель сессии (Claude или локальная)' },
           { command: 'rename', description: 'Переименовать эту тему: /rename Название' },
           { command: 'new', description: 'Запустить новую сессию: выбрать или создать папку' },
           { command: 'stop', description: 'Прервать текущее действие сессии (как Esc)' },

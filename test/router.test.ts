@@ -98,7 +98,7 @@ test('две сессии получают разные темы, сообщен
   const rb = await b.call({ op: 'register', key: '/p/b::main', name: 'main', dir: '/p/b' })
   expect(ra.ok && rb.ok).toBe(true)
   expect(ra.result.thread_id).not.toBe(rb.result.thread_id)
-  expect(ra.result.title).toBe('a — main')
+  expect(ra.result.title).toBe('a')
 
   updates.push(fakeUpdate('привет A', ra.result.thread_id))
   updates.push(fakeUpdate('привет B', rb.result.thread_id))
@@ -151,7 +151,7 @@ test('/sessions в общей теме отвечает списком', async (
   updates.push(fakeUpdate('/sessions'))
   await Bun.sleep(600)
   const m = calls.find(x => x.method === 'sendMessage')
-  expect(m?.body.text).toContain('a — main')
+  expect(m?.body.text).toMatch(/(🟢|⚪️) a(\n|$)/)
 })
 
 test('статус: читает журнал сессии, показывает действия и снимает по end_turn', async () => {

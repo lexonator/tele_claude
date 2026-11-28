@@ -929,7 +929,7 @@ function mirrorTick() {
       let busy: boolean | undefined, what: string | undefined
       for (const line of lines) {
         let e: any; try { e = JSON.parse(line) } catch { continue }
-        if (e?.isSidechain || e?.isMeta) continue
+        if (e?.isSidechain || e?.isMeta || e?.isCompactSummary) continue
         // Видим, что сессия работает, даже если задание дали не через Telegram (терминал, цикл, подагенты).
         if (e?.type === 'assistant') {
           busy = e.message?.stop_reason === 'end_turn' ? false : true
@@ -942,7 +942,7 @@ function mirrorTick() {
           const t = mirrorText(e.message?.content).trim()
           if (!t) continue
           if (t.includes('<channel source=')) { m.mode = 'tg'; continue }
-          if (t.startsWith('<') || t.startsWith('[Request interrupted') || t.startsWith('Caveat:')) continue
+          if (t.startsWith('This session is being continued') || t.startsWith('<') || t.startsWith('[Request interrupted') || t.startsWith('Caveat:')) continue
           m.mode = 'term'; m.replied = false
           mirrorSend(key, `🖥 Из терминала:\n${t}`)
           actStart(key)

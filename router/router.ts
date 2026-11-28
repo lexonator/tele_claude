@@ -155,13 +155,10 @@ function cleanOrphanStatuses() {
   } catch {}
 }
 
-// Анимация: цветной кружок меняет цвет (кадр раз в 3 секунды), плюс «печатает…» в шапке.
-const SPIN = ['🔵', '🟣', '🔴', '🟠', '🟡', '🟢']
+// Строка статуса начинается с 🔵; анимация — «печатает…» в шапке и обновление текста действия.
+const SPIN = ['🔵']
 const modelTail = (key: string) => (sessions[key]?.model ? ` · ${sessions[key]!.model}` : '')
 const renderStatus = (key: string, a: Act) => `${SPIN[(a.frame ?? 0) % SPIN.length]} ${a.text}${modelTail(key)}`
-setInterval(() => {
-  for (const [key, a] of activity) { if (a.msgId != null && a.msgId > 0) { a.frame = (a.frame ?? 0) + 1; flushStatus(key) } }
-}, 3000)
 
 // Сообщение-«хвост», когда сессия не работает: стоит в самом низу темы и уходит, когда начинается новая работа.
 const restMsgs = new Map<string, number>()

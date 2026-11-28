@@ -293,6 +293,39 @@ function newestTranscript(dir: string): string | undefined {
   } catch { return undefined }
 }
 
+// Фоновые агенты сессии: их журналы лежат в <журнал сессии>/subagents/*.jsonl; свежий файл = агент работает.
+function subAgents(key: string): { n: number; what?: string } {
+  try {
+    const f = newestTranscript(key.split('::')[0]!)
+    if (!f) return { n: 0 }
+    const sd = join(f.slice(0, -'.jsonl'.length), 'subagents')
+    const now = Date.now()
+    let n = 0, best: { f: string; t: number } | undefined
+    for (const nm of readdirSync(sd)) {
+      if (!nm.endsWith('.jsonl')) continue
+      const p = join(sd, nm), t = statSync(p).mtimeMs
+      if (now - t > 25_000) continue
+      n++
+      if (!best || t > best.t) best = { f: p, t }
+    }
+    let what: string | undefined
+    if (best) {
+      const size = statSync(best.f), fd = openSync(best.f, 'r'), len = Math.min(size.size, 60_000), buf = Buffer.alloc(len)
+      readSync(fd, buf, 0, len, size.size - len); closeSync(fd)
+      for (const line of buf.toString('utf8').split('\n').reverse()) {
+        let e: any; try { e = JSON.parse(line) } catch { continue }
+        const tu = Array.isArray(e?.message?.content) ? e.message.content.find((b: any) => b?.type === 'tool_use') : undefined
+        if (tu) { what = describeTool(tu.name, tu.input) ?? undefined; if (what) break }
+      }
+    }
+    return { n, what }
+  } catch { return { n: 0 } }
+}
+function subText(sa: { n: number; what?: string }): string {
+  const w = sa.what ? sa.what.replace(/^\S+\s/u, '') : ''
+  return `🤖 Фоновые агенты работают: ${sa.n}${w ? ' · ' + w : ''}`
+}
+
 function watchTranscript(key: string): ReturnType<typeof setInterval> {
   const dir = key.split('::')[0]!
   let file = newestTranscript(dir)
@@ -321,7 +354,7 @@ function watchTranscript(key: string): ReturnType<typeof setInterval> {
             else if (b.type === 'tool_use') { const d = describeTool(b.name, b.input); if (d) { const a0 = activity.get(key); if (a0) a0.lastTool = d; actSet(key, d) } }
             else if (b.type === 'thinking' && b.thinking) actSet(key, '💭 ' + String(b.thinking).replace(/\s+/g, ' ').trim().slice(-240))
           }
-          if (msg.stop_reason === 'end_turn') actStop(key)
+          if (msg.stop_reason === 'end_turn') { const sa = subAgents(key); if (sa.n) actSet(key, subText(sa)); else actStop(key) }
         } else if (e?.type === 'user' && JSON.stringify(msg?.content ?? '').includes('Request interrupted')) {
           actStop(key, 'int') // ход прерван (Esc)
         } else if (e?.type === 'user' && Array.isArray(msg?.content) && msg.content.some((b: any) => b.type === 'tool_result')) {
@@ -891,7 +924,7 @@ async function newCallback(ctx: any, d: string) {
 // Ход, начатый из Telegram, уже виден в теме (ответ идёт через reply), поэтому дублируем только то, что набрано в терминале.
 const MIRROR_OFF = join(STATE_DIR, 'mirror.off')
 const mirrorOn = () => !existsSync(MIRROR_OFF)
-type Mir = { file?: string; offset: number; rest: string; mode: 'tg' | 'term'; replied?: boolean }
+type Mir = { file?: string; offset: number; rest: string; mode: 'tg' | 'term'; replied?: boolean; sub?: boolean }
 const mirrors = new Map<string, Mir>()
 const mirrorQueue: Array<{ key: string; thread?: number; text: string }> = []
 setInterval(() => {
@@ -921,6 +954,11 @@ function mirrorTick() {
       if (!file) continue
       if (!m) { m = { file, offset: statSync(file).size, rest: '', mode: 'tg' }; mirrors.set(key, m); continue } // первое знакомство: историю не пересылаем
       if (m.file !== file) { m.file = file; m.offset = 0; m.rest = '' } // новый файл журнала читаем с начала
+      { // фоновые агенты: показываем, пока они работают, и снимаем статус, когда затихли
+        const sa = subAgents(key), act = activity.get(key)
+        if (sa.n) { if (!act) actStart(key, subText(sa)); else if (m.sub || /^🤖 Фоновые/.test(act.text)) actSet(key, subText(sa)); m.sub = true }
+        else if (m.sub) { m.sub = false; if (activity.get(key) && /^🤖 Фоновые/.test(activity.get(key)!.text)) actStop(key) }
+      }
       const size = statSync(file).size
       if (size <= m.offset) continue
       const fd = openSync(file, 'r'); const buf = Buffer.alloc(Math.min(size - m.offset, 1 << 20))

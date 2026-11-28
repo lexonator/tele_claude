@@ -536,6 +536,12 @@ async function handleInbound(ctx: any, text: string, dl?: () => Promise<string |
     catch (e) { return void (await say(`Не получилось переименовать: ${e}`)) }
   }
   if (/^\/rename(@\w+)?\s*$/i.test(text.trim())) return void (await bot.api.sendMessage(GROUP, 'Напишите новое название: /rename Новое название. Или переименуйте тему вручную (нажмите на название темы сверху → «Изменить»): бот это название не трогает.', withThread(tid)).catch(() => {}))
+  const mi = /^\/mirror(@\w+)?(?:\s+(on|off))?\s*$/i.exec(text.trim())
+  if (mi) {
+    const arg = mi[2]?.toLowerCase()
+    if (arg === 'off') writeFileSync(MIRROR_OFF, '1'); else if (arg === 'on' || !arg) { try { unlinkSync(MIRROR_OFF) } catch {} }
+    return void (await bot.api.sendMessage(GROUP, mirrorOn() ? '🖥 Зеркало включено: что набрано в окне терминала и ответы на это дублируются сюда. Отключить: /mirror off' : 'Зеркало выключено. Включить: /mirror on', withThread(tid)).catch(() => {}))
+  }
   if (/^\/model(@\w+)?(\s|$)/i.test(text)) {
     const key = keyFor(tid)
     if (!key || !clients.has(key)) return void (await bot.api.sendMessage(GROUP, 'Для этой темы нет запущенной сессии.', withThread(tid)).catch(() => {}))
@@ -793,6 +799,64 @@ async function newCallback(ctx: any, d: string) {
   await ans()
 }
 
+// ---------- зеркало: переписка в окне терминала дублируется в тему ----------
+// Ход, начатый из Telegram, уже виден в теме (ответ идёт через reply), поэтому дублируем только то, что набрано в терминале.
+const MIRROR_OFF = join(STATE_DIR, 'mirror.off')
+const mirrorOn = () => !existsSync(MIRROR_OFF)
+type Mir = { file?: string; offset: number; rest: string; mode: 'tg' | 'term' }
+const mirrors = new Map<string, Mir>()
+const mirrorQueue: Array<{ thread?: number; text: string }> = []
+setInterval(() => {
+  const m = mirrorQueue.shift()
+  if (!m) return
+  bot.api.sendMessage(GROUP, m.text, { ...withThread(m.thread), disable_notification: true }).catch(e => {
+    if (/retry after|Too Many/i.test(String(e))) mirrorQueue.unshift(m); else log(`зеркало: ${e}`)
+  })
+}, 1300)
+function mirrorSend(key: string, text: string) {
+  const thread = threadForKey(key)
+  for (const part of chunk(text, 3900, 'newline')) mirrorQueue.push({ thread, text: part })
+}
+function mirrorText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  if (content.some((b: any) => b?.type === 'tool_result')) return ''
+  return content.filter((b: any) => b?.type === 'text').map((b: any) => b.text).join('\n')
+}
+function mirrorTick() {
+  if (!mirrorOn()) { mirrors.clear(); return }
+  for (const key of clients.keys()) {
+    try {
+      const dir = key.split('::')[0]!
+      let m = mirrors.get(key)
+      const file = newestTranscript(dir)
+      if (!file) continue
+      if (!m) { m = { file, offset: statSync(file).size, rest: '', mode: 'tg' }; mirrors.set(key, m); continue } // первое знакомство: историю не пересылаем
+      if (m.file !== file) { m.file = file; m.offset = 0; m.rest = '' } // новый файл журнала читаем с начала
+      const size = statSync(file).size
+      if (size <= m.offset) continue
+      const fd = openSync(file, 'r'); const buf = Buffer.alloc(Math.min(size - m.offset, 1 << 20))
+      readSync(fd, buf, 0, buf.length, m.offset); closeSync(fd); m.offset += buf.length
+      const lines = (m.rest + buf.toString('utf8')).split('\n'); m.rest = lines.pop() ?? ''
+      for (const line of lines) {
+        let e: any; try { e = JSON.parse(line) } catch { continue }
+        if (e?.isSidechain || e?.isMeta) continue
+        if (e?.type === 'user') {
+          const t = mirrorText(e.message?.content).trim()
+          if (!t) continue
+          if (t.includes('<channel source=')) { m.mode = 'tg'; continue }
+          if (t.startsWith('<') || t.startsWith('[Request interrupted') || t.startsWith('Caveat:')) continue
+          m.mode = 'term'
+          mirrorSend(key, `🖥 Из терминала:\n${t}`)
+        } else if (e?.type === 'assistant' && m.mode === 'term' && Array.isArray(e.message?.content)) {
+          for (const b of e.message.content) if (b?.type === 'text' && String(b.text ?? '').trim()) mirrorSend(key, `🤖 ${String(b.text).trim()}`)
+        }
+      }
+    } catch {}
+  }
+}
+setInterval(mirrorTick, 1500)
+
 // ---------- модель сессии: подпись в названии темы и команда /model ----------
 function modelShort(id: string): string {
   const m = /^claude-([a-z]+)-(\d+)(?:-(\d+))?/.exec(id)
@@ -981,7 +1045,7 @@ async function serviceCommand(ctx: any, text: string, tid?: number) {
       : 'Сессий пока нет.'
     await bot.api.sendMessage(chatId, lines + '\n\n🟢 запущена, ⚪️ не запущена', opts)
   } else {
-    await bot.api.sendMessage(chatId, 'У каждой сессии Claude Code своя тема. Пишите в тему, и сообщение попадёт только в эту сессию.\n\n/model — сменить модель (Claude или локальная)\n/rename <название> — переименовать тему\n/new — запустить сессию в нужной папке (по шагам)\n/windows — окна кнопками\n/sessions — список сессий\n/show <имя> — открыть окно терминала с сессией (в теме сессии имя не нужно)\n/hide <имя> — скрыть окно, сессия продолжит работать\n/hideall — скрыть все окна', opts)
+    await bot.api.sendMessage(chatId, 'У каждой сессии Claude Code своя тема. Пишите в тему, и сообщение попадёт только в эту сессию.\n\n/mirror on|off — дублировать переписку из терминала\n/model — сменить модель (Claude или локальная)\n/rename <название> — переименовать тему\n/new — запустить сессию в нужной папке (по шагам)\n/windows — окна кнопками\n/sessions — список сессий\n/show <имя> — открыть окно терминала с сессией (в теме сессии имя не нужно)\n/hide <имя> — скрыть окно, сессия продолжит работать\n/hideall — скрыть все окна', opts)
   }
 }
 
@@ -1118,6 +1182,7 @@ for (let attempt = 1; !stopping; attempt++) {
       onStart: info => {
         attempt = 0; botUsername = info.username; log(`polling as @${info.username}`)
         const cmds = [
+          { command: 'mirror', description: 'Дублировать переписку из терминала сюда: on/off' },
           { command: 'model', description: 'Сменить модель сессии (Claude или локальная)' },
           { command: 'rename', description: 'Переименовать эту тему: /rename Название' },
           { command: 'new', description: 'Запустить новую сессию: выбрать или создать папку' },

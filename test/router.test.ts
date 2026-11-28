@@ -206,3 +206,24 @@ test('/new: показывает папки, просит имя новой и �
   expect(calls.some(x => x.method === 'sendMessage' && String(x.body.text).includes('латинские буквы'))).toBe(true)
   expect(existsSync(join(dir, 'proj', 'плохое имя с пробелами'))).toBe(false)
 })
+
+test('зеркало: набранное в терминале дублируется в тему, ход из Telegram не дублируется', async () => {
+  const c = await TestClient.open()
+  const r = await c.call({ op: 'register', key: '/p/m::main', name: 'main', dir: '/p/m' })
+  const pd = join(dir, 'projects', '-p-m'); mkdirSync(pd, { recursive: true })
+  const tr = join(pd, 's1.jsonl'); writeFileSync(tr, '')
+  await Bun.sleep(2200) // первое знакомство с журналом
+  calls.length = 0
+  const A = (text: string) => JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text }] } }) + '\n'
+  const U = (text: string) => JSON.stringify({ type: 'user', message: { content: text } }) + '\n'
+  appendFileSync(tr, U('привет из терминала') + A('ответ в терминале'))
+  await Bun.sleep(4500)
+  const texts = () => calls.filter(x => x.method === 'sendMessage').map(x => String(x.body.text))
+  expect(texts().some(t => t.includes('привет из терминала'))).toBe(true)
+  expect(texts().some(t => t.includes('ответ в терминале'))).toBe(true)
+  expect(calls.find(x => x.method === 'sendMessage' && String(x.body.text).includes('привет из'))!.body.message_thread_id).toBe(r.result.thread_id)
+  calls.length = 0
+  appendFileSync(tr, U('<channel source="tele" chat_id="1">из телеги</channel>') + A('этот ответ уже ушёл через reply'))
+  await Bun.sleep(3500)
+  expect(texts().some(t => t.includes('из телеги') || t.includes('уже ушёл'))).toBe(false)
+}, 20000)

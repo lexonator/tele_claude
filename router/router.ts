@@ -181,7 +181,16 @@ function renderStatusMsg(key: string, a: Act): { text: string; entities?: Array<
     ? { text: `${ch} ${rest}${tail}`, entities: [{ type: 'custom_emoji', offset: 0, length: ch.length, custom_emoji_id: id }] }
     : { text: `${rest}${tail}` }
 }
-setInterval(() => { for (const [key, a] of activity) if (a.msgId != null && a.msgId > 0) flushStatus(key) }, 3000)
+setInterval(() => { for (const [key, a] of activity) if (a.msgId != null && a.msgId > 0) flushStatus(key) }, 15_000)
+// Лимит Telegram: около 20 сообщений в минуту на группу. На правки статусов отдаём не больше 10 в минуту суммарно и замолкаем на время 429.
+const editTimes: number[] = []
+let editPauseUntil = 0
+function allowEdit(): boolean {
+  const now = Date.now()
+  while (editTimes.length && now - editTimes[0]! > 60_000) editTimes.shift()
+  if (now < editPauseUntil || editTimes.length >= 10) return false
+  editTimes.push(now); return true
+}
 
 // Сообщение-«хвост», когда сессия не работает: стоит в самом низу темы и уходит, когда начинается новая работа.
 const restMsgs = new Map<string, number>()
@@ -263,9 +272,10 @@ function flushStatus(key: string) {
   const a = activity.get(key)
   if (!a || a.msgId == null || a.msgId < 0) return
   if (Date.now() - a.lastEdit < 1500) return
+  if (!allowEdit()) { if (!a.pending) { a.pending = a.text; setTimeout(() => { a.pending = undefined; flushStatus(key) }, 6000) } return }
   a.lastEdit = Date.now()
   a.pending = undefined
-  void bot.api.editMessageText(GROUP, a.msgId, renderStatusMsg(key, a).text, { entities: renderStatusMsg(key, a).entities, reply_markup: stopKb(a.thread != null ? String(a.thread) : 'g') }).catch(e => { if (!/not modified/i.test(String(e))) log(`статус: edit не удался: ${e}`) })
+  void bot.api.editMessageText(GROUP, a.msgId, renderStatusMsg(key, a).text, { entities: renderStatusMsg(key, a).entities, reply_markup: stopKb(a.thread != null ? String(a.thread) : 'g') }).catch(e => { const m = /retry after (\d+)/.exec(String(e)); if (m) editPauseUntil = Date.now() + (+m[1] + 2) * 1000; else if (!/not modified/i.test(String(e))) log(`статус: edit не удался: ${e}`) })
 }
 
 // Читаем «хвост» журнала сессии Claude Code (jsonl): оттуда видно, какие инструменты вызываются,

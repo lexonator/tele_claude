@@ -158,6 +158,11 @@ function cleanOrphanStatuses() {
 // Строка статуса начинается с 🔵; анимация — «печатает…» в шапке и обновление текста действия.
 const SPIN = ['🔵']
 const modelTail = (key: string) => (sessions[key]?.model ? ` · ${sessions[key]!.model}` : '')
+// Анимированный (custom) эмодзи для начала строки статуса: id хранится в ~/.tele_claude/status-emoji.id, задаётся командой /statusemoji.
+const EMOJI_FILE = join(STATE_DIR, 'status-emoji.id')
+let statusEmojiId = ''
+try { statusEmojiId = readFileSync(EMOJI_FILE, 'utf8').trim() } catch {}
+const statusEntities = () => (statusEmojiId ? { entities: [{ type: 'custom_emoji' as const, offset: 0, length: 2, custom_emoji_id: statusEmojiId }] } : {})
 const renderStatus = (key: string, a: Act) => `${SPIN[(a.frame ?? 0) % SPIN.length]} ${a.text}${modelTail(key)}`
 
 // Сообщение-«хвост», когда сессия не работает: стоит в самом низу темы и уходит, когда начинается новая работа.
@@ -215,7 +220,7 @@ function actSet(key: string, text: string) {
   if (a.msgId == null) {
     a.lastEdit = now
     a.msgId = -1 // занято: сообщение создаётся
-    void bot.api.sendMessage(GROUP, renderStatus(key, a), { ...withThread(a.thread), disable_notification: true, reply_markup: stopKb(a.thread != null ? String(a.thread) : 'g') })
+    void bot.api.sendMessage(GROUP, renderStatus(key, a), { ...withThread(a.thread), ...statusEntities(), disable_notification: true, reply_markup: stopKb(a.thread != null ? String(a.thread) : 'g') })
       .then(m => {
         const cur = activity.get(key)
         if (cur === a) { a.msgId = m.message_id; statusMsgs[key] = m.message_id; saveStatus(); if (a.text !== text) flushStatus(key) }
@@ -238,7 +243,7 @@ function flushStatus(key: string) {
   if (Date.now() - a.lastEdit < 1500) return
   a.lastEdit = Date.now()
   a.pending = undefined
-  void bot.api.editMessageText(GROUP, a.msgId, renderStatus(key, a), { reply_markup: stopKb(a.thread != null ? String(a.thread) : 'g') }).catch(e => { if (!/not modified/i.test(String(e))) log(`статус: edit не удался: ${e}`) })
+  void bot.api.editMessageText(GROUP, a.msgId, renderStatus(key, a), { ...statusEntities(), reply_markup: stopKb(a.thread != null ? String(a.thread) : 'g') }).catch(e => { if (!/not modified/i.test(String(e))) log(`статус: edit не удался: ${e}`) })
 }
 
 // Читаем «хвост» журнала сессии Claude Code (jsonl): оттуда видно, какие инструменты вызываются,
@@ -576,6 +581,14 @@ async function handleInbound(ctx: any, text: string, dl?: () => Promise<string |
     catch (e) { return void (await say(`Не получилось переименовать: ${e}`)) }
   }
   if (/^\/rename(@\w+)?\s*$/i.test(text.trim())) return void (await bot.api.sendMessage(GROUP, 'Напишите новое название: /rename Новое название. Или переименуйте тему вручную (нажмите на название темы сверху → «Изменить»): бот это название не трогает.', withThread(tid)).catch(() => {}))
+  if (/^\/statusemoji(@\w+)?(\s|$)/i.test(text)) {
+    const say = (t: string) => bot.api.sendMessage(GROUP, t, withThread(tid)).catch(() => {})
+    const ce = (ctx.message?.entities ?? []).find((e: any) => e.type === 'custom_emoji') as any
+    if (/\boff\b/i.test(text)) { statusEmojiId = ''; try { unlinkSync(EMOJI_FILE) } catch {}; return void (await say('Вернул обычный 🔵 в строке статуса.')) }
+    if (!ce) return void (await say('Отправьте команду вместе с анимированным эмодзи: /statusemoji и сразу за ним нужный эмодзи (нужен Telegram Premium). Вернуть обычный: /statusemoji off'))
+    statusEmojiId = String(ce.custom_emoji_id); writeFileSync(EMOJI_FILE, statusEmojiId)
+    return void (await say('Запомнил. Теперь строка статуса начинается с этого эмодзи (анимация видна в самой теме).'))
+  }
   const mi = /^\/mirror(@\w+)?(?:\s+(on|off))?\s*$/i.exec(text.trim())
   if (mi) {
     const arg = mi[2]?.toLowerCase()
@@ -1235,6 +1248,7 @@ for (let attempt = 1; !stopping; attempt++) {
       onStart: info => {
         attempt = 0; botUsername = info.username; log(`polling as @${info.username}`)
         const cmds = [
+          { command: 'statusemoji', description: 'Анимированный эмодзи в строке статуса: /statusemoji 🔵' },
           { command: 'mirror', description: 'Дублировать переписку из терминала сюда: on/off' },
           { command: 'model', description: 'Сменить модель сессии (Claude или локальная)' },
           { command: 'rename', description: 'Переименовать эту тему: /rename Название' },

@@ -256,3 +256,18 @@ test('сессия работает без задания из Telegram: ста�
   expect(calls.some(x => x.method === 'sendChatAction' && x.body.message_thread_id === r.result.thread_id)).toBe(true)
   expect(calls.some(x => x.method === 'sendMessage' && x.body.message_thread_id === r.result.thread_id && String(x.body.text).includes('Читаю x.ts'))).toBe(true)
 }, 20000)
+
+test('/statusemoji запоминает анимированный эмодзи, статус начинается с него', async () => {
+  const c = await TestClient.open()
+  const r = await c.call({ op: 'register', key: '/p/e::main', name: 'main', dir: '/p/e' })
+  const u: any = fakeUpdate('/statusemoji 🔵', r.result.thread_id)
+  u.message.entities = [{ type: 'bot_command', offset: 0, length: 12 }, { type: 'custom_emoji', offset: 13, length: 2, custom_emoji_id: '123456' }]
+  updates.push(u)
+  await Bun.sleep(900)
+  expect(existsSync(join(dir, 'status-emoji.id'))).toBe(true)
+  calls.length = 0
+  updates.push(fakeUpdate('поработай', r.result.thread_id))
+  await Bun.sleep(1500)
+  const st = calls.find(x => x.method === 'sendMessage' && String(x.body.text).startsWith('🔵'))
+  expect(JSON.stringify(st?.body.entities)).toContain('123456')
+}, 20000)

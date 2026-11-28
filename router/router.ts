@@ -168,14 +168,11 @@ const iconIds = new Map<string, string>() // эмодзи -> custom_emoji_id
 void bot.api.getForumTopicIconStickers().then(r => { if (Array.isArray(r)) for (const st of r) if (st.emoji && st.custom_emoji_id) iconIds.set(noVS(st.emoji), st.custom_emoji_id) }).catch(() => {})
 // эмодзи в тексте статуса -> эмодзи из набора значков
 const ACT_ICON: Array<[string, string]> = [['📖', '📚'], ['✏️', '✍️'], ['📝', '📝'], ['⚙️', '💻'], ['🔎', '🔎'], ['🌐', '🔭'], ['🤖', '🤖'], ['📋', '✅'], ['🔧', '⚡️'], ['💭', '🧠'], ['🟡', '❓'], ['🔐', '❗️'], ['❓', '❓']]
+// Без своего значка: анимированные точки «•••» рядом с сообщением рисует сам Telegram («печатает…»), лишние картинки не нужны.
 function renderStatusMsg(key: string, a: Act): { text: string; entities?: Array<{ type: 'custom_emoji'; offset: number; length: number; custom_emoji_id: string }> } {
   const tail = modelTail(key)
-  if (statusEmojiId) return { text: `${SPIN[0]} ${a.text}${tail}`, entities: [{ type: 'custom_emoji', offset: 0, length: 2, custom_emoji_id: statusEmojiId }] }
-  const hit = ACT_ICON.find(([from]) => noVS(a.text).startsWith(noVS(from)))
-  if (!hit) return { text: `${SPIN[0]} ${a.text}${tail}` }
-  const rest = a.text.slice(hit[0].length).trim()
-  const ch = hit[1], id = iconIds.get(noVS(ch))
-  return { text: `${ch} ${rest}${tail}`, ...(id ? { entities: [{ type: 'custom_emoji' as const, offset: 0, length: ch.length, custom_emoji_id: id }] } : {}) }
+  if (statusEmojiId) return { text: `${SPIN[0]} ${a.text.replace(/^\p{Extended_Pictographic}\uFE0F?\s*/u, '')}${tail}`, entities: [{ type: 'custom_emoji', offset: 0, length: 2, custom_emoji_id: statusEmojiId }] }
+  return { text: `${a.text.replace(/^\p{Extended_Pictographic}\uFE0F?\s*/u, '')}${tail}` }
 }
 
 // Сообщение-«хвост», когда сессия не работает: стоит в самом низу темы и уходит, когда начинается новая работа.

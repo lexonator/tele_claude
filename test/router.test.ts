@@ -168,8 +168,8 @@ test('статус: читает журнал сессии, показывает
   const texts = calls.filter(x => x.method === 'sendMessage' || x.method === 'editMessageText').map(x => x.body.text)
   expect(texts.some(t => String(t).includes('Читаю a.ts'))).toBe(true)
   const withIcon = calls.find(x => (x.method === 'sendMessage' || x.method === 'editMessageText') && String(x.body.text).includes('Читаю a.ts'))!
-  expect(String(withIcon.body.text).startsWith('📚')).toBe(true)
-  expect(JSON.stringify(withIcon.body.entities)).toContain('9001')
+  expect(String(withIcon.body.text).startsWith('Читаю a.ts')).toBe(true)
+  expect(withIcon.body.entities).toBeUndefined()
   appendFileSync(tr, JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn' } }) + '\n')
   await Bun.sleep(1500)
   expect(calls.some(x => x.method === 'deleteMessage')).toBe(true)

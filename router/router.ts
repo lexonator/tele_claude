@@ -101,8 +101,8 @@ function baseTitle(s: { name: string; dir: string; title?: string }) {
   const project = s.dir.split('/').filter(Boolean).pop() ?? 'session'
   return s.title ?? (s.name === 'main' ? project : `${project} — ${s.name}`)
 }
-// Названия тем не меняем: каждое переименование Telegram пишет в тему служебной строкой, и она перебивает последнее сообщение.
-const topicTitle = (s: { name: string; dir: string; title?: string }) => baseTitle(s).slice(0, 128)
+// Название темы: имя проекта + модель. Переименовываем только при смене модели (каждое переименование Telegram пишет в тему служебную строку).
+const topicTitle = (s: { name: string; dir: string; title?: string; model?: string }) => (s.model ? `${baseTitle(s)} · ${s.model}` : baseTitle(s)).slice(0, 128)
 const stripModel = (t: string) => t.replace(/^(🟢|🔵|🟡|⚪️?)\s*/u, '').replace(/ · [^·]+$/, '')
 const touchStatus = (_key: string) => {}
 
@@ -920,12 +920,11 @@ function readModel(dir: string): string | undefined {
   } catch { return undefined }
 }
 const renameQueue: string[] = []
-function queueRename(_key: string) {}
+function queueRename(key: string) { if (!renameQueue.includes(key)) renameQueue.push(key) }
 setInterval(() => {
   const key = renameQueue.shift()
   const s = key ? sessions[key] : undefined
   if (!key || !s || key === generalKey || clients.get(key)?.general) return
-  sentStatus.set(key, computeStatus(key))
   bot.api.editForumTopic(GROUP, s.thread_id, { name: topicTitle(s) }).catch(e => {
     const m = /retry after (\d+)/.exec(String(e))
     if (m) { renameQueue.unshift(key); setTimeout(() => {}, 0) }

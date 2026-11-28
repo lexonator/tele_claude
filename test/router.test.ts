@@ -98,7 +98,7 @@ test('две сессии получают разные темы, сообщен
   const rb = await b.call({ op: 'register', key: '/p/b::main', name: 'main', dir: '/p/b' })
   expect(ra.ok && rb.ok).toBe(true)
   expect(ra.result.thread_id).not.toBe(rb.result.thread_id)
-  expect(ra.result.title).toBe('🟢 a')
+  expect(ra.result.title).toBe('a')
 
   updates.push(fakeUpdate('привет A', ra.result.thread_id))
   updates.push(fakeUpdate('привет B', rb.result.thread_id))
@@ -228,13 +228,23 @@ test('зеркало: набранное в терминале дублируе�
   expect(texts().some(t => t.includes('из телеги') || t.includes('уже ушёл'))).toBe(false)
 }, 20000)
 
-test('состояние сессии в названии темы: 🟢 свободна, 🔵 работает', async () => {
+test('статус: внизу темы всегда «хвост» — после конца хода появляется «Готово», с новой задачей уходит', async () => {
   const c = await TestClient.open()
-  const r = await c.call({ op: 'register', key: '/p/z::main', name: 'main', dir: '/p/z' })
-  await Bun.sleep(3200)
-  const names = () => calls.filter(x => x.method === 'editForumTopic' && x.body.message_thread_id === r.result.thread_id).map(x => String(x.body.name))
-  expect(names().some(n => n.startsWith('🟢 z'))).toBe(true)
-  updates.push(fakeUpdate('работай', r.result.thread_id))
-  await Bun.sleep(3500)
-  expect(names().some(n => n.startsWith('🔵 z'))).toBe(true)
+  const r = await c.call({ op: 'register', key: '/p/y::main', name: 'main', dir: '/p/y' })
+  const pd = join(dir, 'projects', '-p-y'); mkdirSync(pd, { recursive: true })
+  const tr = join(pd, 's1.jsonl'); writeFileSync(tr, '')
+  updates.push(fakeUpdate('сделай', r.result.thread_id))
+  await c.waitEvent()
+  await Bun.sleep(900)
+  calls.length = 0
+  appendFileSync(tr, JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn' } }) + '\n')
+  await Bun.sleep(2500)
+  const rest = calls.find(x => x.method === 'sendMessage' && String(x.body.text).includes('Готово, жду'))
+  expect(rest).toBeTruthy()
+  expect(rest!.body.message_thread_id).toBe(r.result.thread_id)
+  expect(calls.some(x => x.method === 'editForumTopic')).toBe(false) // названия не трогаем
+  calls.length = 0
+  updates.push(fakeUpdate('следующее', r.result.thread_id))
+  await Bun.sleep(1500)
+  expect(calls.some(x => x.method === 'deleteMessage')).toBe(true) // «хвост» убран
 }, 20000)

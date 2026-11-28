@@ -101,21 +101,10 @@ function baseTitle(s: { name: string; dir: string; title?: string }) {
   const project = s.dir.split('/').filter(Boolean).pop() ?? 'session'
   return s.title ?? (s.name === 'main' ? project : `${project} — ${s.name}`)
 }
-// Состояние сессии в начале названия: 🔵 работает, 🟡 ждёт вашего решения, 🟢 свободна, ⚪️ не запущена.
-const STATUS_EMOJI: Record<string, string> = { work: '🔵', ask: '🟡', idle: '🟢', off: '⚪️' }
-function computeStatus(key: string): string {
-  if (!clients.has(key)) return 'off'
-  for (const a of asks.values()) if (a.key === key) return 'ask'
-  for (const o of permOwner.values()) if (o === key) return 'ask'
-  return activity.has(key) ? 'work' : 'idle'
-}
-function topicTitle(s: { name: string; dir: string; title?: string; model?: string; key?: string }) {
-  const base = s.model ? `${baseTitle(s)} · ${s.model}` : baseTitle(s)
-  return (s.key ? `${STATUS_EMOJI[computeStatus(s.key)]} ${base}` : base).slice(0, 128)
-}
+// Названия тем не меняем: каждое переименование Telegram пишет в тему служебной строкой, и она перебивает последнее сообщение.
+const topicTitle = (s: { name: string; dir: string; title?: string }) => baseTitle(s).slice(0, 128)
 const stripModel = (t: string) => t.replace(/^(🟢|🔵|🟡|⚪️?)\s*/u, '').replace(/ · [^·]+$/, '')
-const sentStatus = new Map<string, string>()
-function touchStatus(key: string) { if (sessions[key] && computeStatus(key) !== sentStatus.get(key)) queueRename(key) }
+const touchStatus = (_key: string) => {}
 
 async function ensureTopic(key: string, name: string, dir: string): Promise<Session> {
   const existing = sessions[key]
@@ -150,7 +139,7 @@ function assertSendable(f: string) {
 }
 
 // ---------- «живой» статус сессии: анимация печати и что она сейчас делает ----------
-type Act = { watch?: ReturnType<typeof setInterval>; hooked?: boolean; thread?: number; typing: ReturnType<typeof setInterval>; kill: ReturnType<typeof setTimeout>; msgId?: number; text: string; lastEdit: number; pending?: string }
+type Act = { watch?: ReturnType<typeof setInterval>; hooked?: boolean; thread?: number; typing: ReturnType<typeof setInterval>; kill: ReturnType<typeof setTimeout>; msgId?: number; text: string; lastEdit: number; pending?: string; frame?: number; bumpAt?: number; bumpT?: ReturnType<typeof setTimeout> }
 const activity = new Map<string, Act>()
 
 // Номера сообщений-статусов храним на диске: если роутер перезапустят посреди работы,
@@ -166,12 +155,49 @@ function cleanOrphanStatuses() {
   } catch {}
 }
 
+// Анимация: часы «идут» (меняем кадр раз в 3 секунды), плюс «печатает…» в шапке.
+const SPIN = ['🕐', '🕑', '🕒', '🕓', '🕔', '🕕', '🕖', '🕗', '🕘', '🕙', '🕚', '🕛']
+const modelTail = (key: string) => (sessions[key]?.model ? ` · ${sessions[key]!.model}` : '')
+const renderStatus = (key: string, a: Act) => `${SPIN[(a.frame ?? 0) % SPIN.length]} ${a.text}${modelTail(key)}`
+setInterval(() => {
+  for (const [key, a] of activity) { if (a.msgId != null && a.msgId > 0) { a.frame = (a.frame ?? 0) + 1; flushStatus(key) } }
+}, 3000)
+
+// Сообщение-«хвост», когда сессия не работает: стоит в самом низу темы и уходит, когда начинается новая работа.
+const restMsgs = new Map<string, number>()
+function restClear(key: string) {
+  const id = restMsgs.get(key)
+  if (id == null) return
+  restMsgs.delete(key); delete statusMsgs['rest:' + key]; saveStatus()
+  void bot.api.deleteMessage(GROUP, id).catch(() => {})
+}
+function restShow(key: string, thread: number | undefined, text: string) {
+  restClear(key)
+  void bot.api.sendMessage(GROUP, text, { ...withThread(thread), disable_notification: true })
+    .then(m => {
+      if (activity.has(key)) { void bot.api.deleteMessage(GROUP, m.message_id).catch(() => {}); return } // за это время началась новая работа
+      restMsgs.set(key, m.message_id); statusMsgs['rest:' + key] = m.message_id; saveStatus()
+    }).catch(() => {})
+}
+// Статус всегда последним: после нового сообщения в теме пересоздаём его внизу.
+function bumpStatus(key: string) {
+  const a = activity.get(key)
+  if (!a || a.msgId == null || a.msgId < 0) return
+  if (Date.now() - (a.bumpAt ?? 0) < 1600) { if (!a.bumpT) a.bumpT = setTimeout(() => { a.bumpT = undefined; bumpStatus(key) }, 1700); return }
+  a.bumpAt = Date.now()
+  const old = a.msgId, text = a.text
+  a.msgId = undefined; a.text = ''
+  void bot.api.deleteMessage(GROUP, old).catch(() => {})
+  actSet(key, text)
+}
+
 const threadForKey = (key: string): number | undefined => clients.get(key)?.general ? undefined : sessions[key]?.thread_id
 const withThread = (t?: number) => (t != null ? { message_thread_id: t } : {})
 
 function actStart(key: string, text = '💭 Думаю…') {
   const prev = activity.get(key)
   if (prev) { actSet(key, text); return }
+  restClear(key)
   const thread = threadForKey(key)
   const typing = setInterval(() => void bot.api.sendChatAction(GROUP, 'typing', withThread(thread)).catch(() => {}), 4000)
   const kill = setTimeout(() => actStop(key), 15 * 60_000) // страховка, если «стоп» не пришёл
@@ -192,7 +218,7 @@ function actSet(key: string, text: string) {
   if (a.msgId == null) {
     a.lastEdit = now
     a.msgId = -1 // занято: сообщение создаётся
-    void bot.api.sendMessage(GROUP, text, { ...withThread(a.thread), disable_notification: true, reply_markup: stopKb(a.thread != null ? String(a.thread) : 'g') })
+    void bot.api.sendMessage(GROUP, renderStatus(key, a), { ...withThread(a.thread), disable_notification: true, reply_markup: stopKb(a.thread != null ? String(a.thread) : 'g') })
       .then(m => {
         const cur = activity.get(key)
         if (cur === a) { a.msgId = m.message_id; statusMsgs[key] = m.message_id; saveStatus(); if (a.text !== text) flushStatus(key) }
@@ -215,7 +241,7 @@ function flushStatus(key: string) {
   if (Date.now() - a.lastEdit < 1500) return
   a.lastEdit = Date.now()
   a.pending = undefined
-  void bot.api.editMessageText(GROUP, a.msgId, a.text, { reply_markup: stopKb(a.thread != null ? String(a.thread) : 'g') }).catch(e => { if (!/not modified/i.test(String(e))) log(`статус: edit не удался: ${e}`) })
+  void bot.api.editMessageText(GROUP, a.msgId, renderStatus(key, a), { reply_markup: stopKb(a.thread != null ? String(a.thread) : 'g') }).catch(e => { if (!/not modified/i.test(String(e))) log(`статус: edit не удался: ${e}`) })
 }
 
 // Читаем «хвост» журнала сессии Claude Code (jsonl): оттуда видно, какие инструменты вызываются,
@@ -262,7 +288,7 @@ function watchTranscript(key: string): ReturnType<typeof setInterval> {
           }
           if (msg.stop_reason === 'end_turn') actStop(key)
         } else if (e?.type === 'user' && JSON.stringify(msg?.content ?? '').includes('Request interrupted')) {
-          actStop(key) // ход прерван (Esc)
+          actStop(key, 'int') // ход прерван (Esc)
         } else if (e?.type === 'user' && Array.isArray(msg?.content) && msg.content.some((b: any) => b.type === 'tool_result')) {
           // результат инструмента получен — модель снова думает (если не пришло ничего нового, строка останется как есть)
           for (const b of msg.content) if (b.type === 'tool_result') askDone(String(b.tool_use_id))
@@ -272,14 +298,15 @@ function watchTranscript(key: string): ReturnType<typeof setInterval> {
   }, 700)
 }
 
-function actStop(key: string) {
+function actStop(key: string, rest: 'idle' | 'int' | 'off' = 'idle') {
   const a = activity.get(key)
   if (!a) return
   activity.delete(key)
-  touchStatus(key)
+  if (a.bumpT) clearTimeout(a.bumpT)
   clearInterval(a.typing); clearTimeout(a.kill); if (a.watch) clearInterval(a.watch)
   if (a.msgId != null && a.msgId > 0) void bot.api.deleteMessage(GROUP, a.msgId).catch(() => {})
   if (statusMsgs[key] != null) { delete statusMsgs[key]; saveStatus() }
+  restShow(key, a.thread, rest === 'off' ? '⚪️ Сессия отключилась' : rest === 'int' ? `⏹ Прервано, жду следующее задание${modelTail(key)}` : `🟢 Готово, жду следующее задание${modelTail(key)}`)
 }
 
 // ---------- вопросы с выбором (AskUserQuestion): показываем кнопками, выбор жмём в терминале ----------
@@ -297,7 +324,7 @@ function askShow(key: string, toolId: string, input: any) {
   if (qs.length !== 1 || qs[0]!.multiSelect) {
     // сложные формы (несколько вопросов или множественный выбор) кнопками пока не поддерживаем
     const text = qs.map(fmt).join('\n\n———\n\n') + '\n\nОтветьте в окне сессии: /show'
-    void bot.api.sendMessage(GROUP, text.slice(0, 4000), withThread(thread)).catch(() => {})
+    void bot.api.sendMessage(GROUP, text.slice(0, 4000), withThread(thread)).then(() => { actSet(key, '🟡 Жду вашего решения'); bumpStatus(key) }).catch(() => {})
     return
   }
   const q = qs[0]!
@@ -309,7 +336,7 @@ function askShow(key: string, toolId: string, input: any) {
   ;(q.options ?? []).forEach((o, i) => kb.text(`${i + 1}. ${(o.label ?? '').slice(0, 50)}`, `ask:${id}:${i}`).row())
   kb.text('✍️ Другое (напишу текстом)', `ask:${id}:${(q.options ?? []).length}`)
   void bot.api.sendMessage(GROUP, fmt(q).slice(0, 4000), { ...withThread(thread), reply_markup: kb })
-    .then(m => { ask.msgId = m.message_id }).catch(e => log(`вопрос: не отправился: ${e}`))
+    .then(m => { ask.msgId = m.message_id; actSet(key, '🟡 Жду вашего решения'); bumpStatus(key) }).catch(e => log(`вопрос: не отправился: ${e}`))
 }
 
 // Ответили (в терминале или кнопкой): убираем кнопки.
@@ -416,6 +443,7 @@ async function handleOp(c: Client, m: Msg): Promise<unknown> {
         ids.push(sent.message_id)
       }
       { const a = activity.get(c.key); if (a && !a.hooked) actStop(c.key) } // у сессии нет хуков — снимаем статус по ответу
+      bumpStatus(c.key)
       return { ids }
     }
     case 'react': {
@@ -442,6 +470,7 @@ async function handleOp(c: Client, m: Msg): Promise<unknown> {
         .text('✅ Allow', `perm:allow:${id}`)
         .text('❌ Deny', `perm:deny:${id}`)
       await bot.api.sendMessage(GROUP, `🔐 Permission: ${m.tool_name}`, { ...(thread != null ? { message_thread_id: thread } : {}), reply_markup: kb })
+      actSet(c.key, `🟡 Жду разрешения: ${m.tool_name}`); bumpStatus(c.key)
       return {}
     }
     case 'activity': {
@@ -516,7 +545,7 @@ const server = createServer(sock => {
     }
   })
   const drop = () => {
-    if (c.key && clients.get(c.key) === c) { actStop(c.key); clients.delete(c.key); touchStatus(c.key); if (generalKey === c.key) generalKey = ''; log(`сессия ${c.key} отключилась`) }
+    if (c.key && clients.get(c.key) === c) { actStop(c.key, 'off'); clients.delete(c.key); if (generalKey === c.key) generalKey = ''; log(`сессия ${c.key} отключилась`) }
   }
   sock.on('close', drop)
   sock.on('error', drop)
@@ -821,17 +850,17 @@ const MIRROR_OFF = join(STATE_DIR, 'mirror.off')
 const mirrorOn = () => !existsSync(MIRROR_OFF)
 type Mir = { file?: string; offset: number; rest: string; mode: 'tg' | 'term' }
 const mirrors = new Map<string, Mir>()
-const mirrorQueue: Array<{ thread?: number; text: string }> = []
+const mirrorQueue: Array<{ key: string; thread?: number; text: string }> = []
 setInterval(() => {
   const m = mirrorQueue.shift()
   if (!m) return
-  bot.api.sendMessage(GROUP, m.text, { ...withThread(m.thread), disable_notification: true }).catch(e => {
+  bot.api.sendMessage(GROUP, m.text, { ...withThread(m.thread), disable_notification: true }).then(() => bumpStatus(m.key)).catch(e => {
     if (/retry after|Too Many/i.test(String(e))) mirrorQueue.unshift(m); else log(`зеркало: ${e}`)
   })
 }, 1300)
 function mirrorSend(key: string, text: string) {
   const thread = threadForKey(key)
-  for (const part of chunk(text, 3900, 'newline')) mirrorQueue.push({ thread, text: part })
+  for (const part of chunk(text, 3900, 'newline')) mirrorQueue.push({ key, thread, text: part })
 }
 function mirrorText(content: unknown): string {
   if (typeof content === 'string') return content
@@ -891,7 +920,7 @@ function readModel(dir: string): string | undefined {
   } catch { return undefined }
 }
 const renameQueue: string[] = []
-function queueRename(key: string) { if (!renameQueue.includes(key)) renameQueue.push(key) }
+function queueRename(_key: string) {}
 setInterval(() => {
   const key = renameQueue.shift()
   const s = key ? sessions[key] : undefined

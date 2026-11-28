@@ -155,8 +155,8 @@ function cleanOrphanStatuses() {
   } catch {}
 }
 
-// Анимация: часы «идут» (меняем кадр раз в 3 секунды), плюс «печатает…» в шапке.
-const SPIN = ['🕐', '🕑', '🕒', '🕓', '🕔', '🕕', '🕖', '🕗', '🕘', '🕙', '🕚', '🕛']
+// Анимация: цветной кружок меняет цвет (кадр раз в 3 секунды), плюс «печатает…» в шапке.
+const SPIN = ['🔵', '🟣', '🔴', '🟠', '🟡', '🟢']
 const modelTail = (key: string) => (sessions[key]?.model ? ` · ${sessions[key]!.model}` : '')
 const renderStatus = (key: string, a: Act) => `${SPIN[(a.frame ?? 0) % SPIN.length]} ${a.text}${modelTail(key)}`
 setInterval(() => {
@@ -306,7 +306,6 @@ function actStop(key: string, rest: 'idle' | 'int' | 'off' = 'idle') {
   clearInterval(a.typing); clearTimeout(a.kill); if (a.watch) clearInterval(a.watch)
   if (a.msgId != null && a.msgId > 0) void bot.api.deleteMessage(GROUP, a.msgId).catch(() => {})
   if (statusMsgs[key] != null) { delete statusMsgs[key]; saveStatus() }
-  restShow(key, a.thread, rest === 'off' ? '⚪️ Сессия отключилась' : rest === 'int' ? `⏹ Прервано, жду следующее задание${modelTail(key)}` : `🟢 Готово, жду следующее задание${modelTail(key)}`)
 }
 
 // ---------- вопросы с выбором (AskUserQuestion): показываем кнопками, выбор жмём в терминале ----------

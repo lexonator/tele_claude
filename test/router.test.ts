@@ -228,25 +228,20 @@ test('зеркало: набранное в терминале дублируе�
   expect(texts().some(t => t.includes('из телеги') || t.includes('уже ушёл'))).toBe(false)
 }, 20000)
 
-test('статус: внизу темы всегда «хвост» — после конца хода появляется «Готово», с новой задачей уходит', async () => {
+test('статус показывается только пока идёт работа: после конца хода сообщение убирается, «Готово» не пишем', async () => {
   const c = await TestClient.open()
   const r = await c.call({ op: 'register', key: '/p/y::main', name: 'main', dir: '/p/y' })
   const pd = join(dir, 'projects', '-p-y'); mkdirSync(pd, { recursive: true })
   const tr = join(pd, 's1.jsonl'); writeFileSync(tr, '')
   updates.push(fakeUpdate('сделай', r.result.thread_id))
   await c.waitEvent()
-  await Bun.sleep(900)
+  await Bun.sleep(1200)
   calls.length = 0
   appendFileSync(tr, JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn' } }) + '\n')
   await Bun.sleep(2500)
-  const rest = calls.find(x => x.method === 'sendMessage' && String(x.body.text).includes('Готово, жду'))
-  expect(rest).toBeTruthy()
-  expect(rest!.body.message_thread_id).toBe(r.result.thread_id)
-  expect(calls.some(x => x.method === 'editForumTopic')).toBe(false) // названия не трогаем
-  calls.length = 0
-  updates.push(fakeUpdate('следующее', r.result.thread_id))
-  await Bun.sleep(1500)
-  expect(calls.some(x => x.method === 'deleteMessage')).toBe(true) // «хвост» убран
+  expect(calls.some(x => x.method === 'deleteMessage')).toBe(true)
+  expect(calls.some(x => x.method === 'sendMessage' && String(x.body.text).includes('Готово'))).toBe(false)
+  expect(calls.some(x => x.method === 'editForumTopic')).toBe(false)
 }, 20000)
 
 test('сессия работает без задания из Telegram: статус и «печатает» всё равно появляются', async () => {

@@ -101,10 +101,21 @@ function baseTitle(s: { name: string; dir: string; title?: string }) {
   const project = s.dir.split('/').filter(Boolean).pop() ?? 'session'
   return s.title ?? (s.name === 'main' ? project : `${project} — ${s.name}`)
 }
-function topicTitle(s: { name: string; dir: string; title?: string; model?: string }) {
-  return (s.model ? `${baseTitle(s)} · ${s.model}` : baseTitle(s)).slice(0, 128)
+// Состояние сессии в начале названия: 🔵 работает, 🟡 ждёт вашего решения, 🟢 свободна, ⚪️ не запущена.
+const STATUS_EMOJI: Record<string, string> = { work: '🔵', ask: '🟡', idle: '🟢', off: '⚪️' }
+function computeStatus(key: string): string {
+  if (!clients.has(key)) return 'off'
+  for (const a of asks.values()) if (a.key === key) return 'ask'
+  for (const o of permOwner.values()) if (o === key) return 'ask'
+  return activity.has(key) ? 'work' : 'idle'
 }
-const stripModel = (t: string) => t.replace(/ · [^·]+$/, '')
+function topicTitle(s: { name: string; dir: string; title?: string; model?: string; key?: string }) {
+  const base = s.model ? `${baseTitle(s)} · ${s.model}` : baseTitle(s)
+  return (s.key ? `${STATUS_EMOJI[computeStatus(s.key)]} ${base}` : base).slice(0, 128)
+}
+const stripModel = (t: string) => t.replace(/^(🟢|🔵|🟡|⚪️?)\s*/u, '').replace(/ · [^·]+$/, '')
+const sentStatus = new Map<string, string>()
+function touchStatus(key: string) { if (sessions[key] && computeStatus(key) !== sentStatus.get(key)) queueRename(key) }
 
 async function ensureTopic(key: string, name: string, dir: string): Promise<Session> {
   const existing = sessions[key]
@@ -166,6 +177,7 @@ function actStart(key: string, text = '💭 Думаю…') {
   const kill = setTimeout(() => actStop(key), 15 * 60_000) // страховка, если «стоп» не пришёл
   const a: Act = { thread, typing, kill, text: '', lastEdit: 0, hooked: true }
   activity.set(key, a)
+  touchStatus(key)
   a.watch = watchTranscript(key)
   void bot.api.sendChatAction(GROUP, 'typing', withThread(thread)).catch(() => {})
   actSet(key, text)
@@ -264,6 +276,7 @@ function actStop(key: string) {
   const a = activity.get(key)
   if (!a) return
   activity.delete(key)
+  touchStatus(key)
   clearInterval(a.typing); clearTimeout(a.kill); if (a.watch) clearInterval(a.watch)
   if (a.msgId != null && a.msgId > 0) void bot.api.deleteMessage(GROUP, a.msgId).catch(() => {})
   if (statusMsgs[key] != null) { delete statusMsgs[key]; saveStatus() }
@@ -291,6 +304,7 @@ function askShow(key: string, toolId: string, input: any) {
   const id = ++askSeq
   const ask: Ask = { key, toolId, thread, q }
   asks.set(id, ask)
+  touchStatus(key)
   const kb = new InlineKeyboard()
   ;(q.options ?? []).forEach((o, i) => kb.text(`${i + 1}. ${(o.label ?? '').slice(0, 50)}`, `ask:${id}:${i}`).row())
   kb.text('✍️ Другое (напишу текстом)', `ask:${id}:${(q.options ?? []).length}`)
@@ -302,7 +316,7 @@ function askShow(key: string, toolId: string, input: any) {
 function askDone(toolId: string, note = '✅ Отвечено') {
   for (const [id, a] of asks) {
     if (a.toolId !== toolId) continue
-    asks.delete(id)
+    asks.delete(id); touchStatus(a.key)
     if (a.msgId != null) void bot.api.editMessageReplyMarkup(GROUP, a.msgId, { reply_markup: new InlineKeyboard() }).catch(() => {})
     if (a.msgId != null) void bot.api.sendMessage(GROUP, note, { ...withThread(a.thread), reply_to_message_id: a.msgId, disable_notification: true }).catch(() => {})
   }
@@ -334,7 +348,7 @@ function askText(key: string, text: string): boolean {
     if (!teleTmuxSessions().includes(name)) return false
     tmux('send-keys', '-t', name, '-l', text)
     tmux('send-keys', '-t', name, 'Enter')
-    asks.delete(id)
+    asks.delete(id); touchStatus(a.key)
     if (a.msgId != null) void bot.api.editMessageReplyMarkup(GROUP, a.msgId, { reply_markup: new InlineKeyboard() }).catch(() => {})
     return true
   }
@@ -362,6 +376,7 @@ async function handleOp(c: Client, m: Msg): Promise<unknown> {
       }
       const s = await ensureTopic(key, name, dir)
       clients.set(key, c)
+      touchStatus(key)
       log(`сессия ${key} онлайн (тема ${s.thread_id})`)
       return { chat_id: GROUP, thread_id: s.thread_id, title: topicTitle(s) }
     }
@@ -420,7 +435,7 @@ async function handleOp(c: Client, m: Msg): Promise<unknown> {
     case 'permission_request': {
       const thread = threadOf(c)
       const id = String(m.request_id)
-      permOwner.set(id, c.key)
+      permOwner.set(id, c.key); touchStatus(c.key)
       permDetails.set(id, { tool_name: String(m.tool_name), description: String(m.description), input_preview: String(m.input_preview) })
       const kb = new InlineKeyboard()
         .text('See more', `perm:more:${id}`)
@@ -501,7 +516,7 @@ const server = createServer(sock => {
     }
   })
   const drop = () => {
-    if (c.key && clients.get(c.key) === c) { actStop(c.key); clients.delete(c.key); if (generalKey === c.key) generalKey = ''; log(`сессия ${c.key} отключилась`) }
+    if (c.key && clients.get(c.key) === c) { actStop(c.key); clients.delete(c.key); touchStatus(c.key); if (generalKey === c.key) generalKey = ''; log(`сессия ${c.key} отключилась`) }
   }
   sock.on('close', drop)
   sock.on('error', drop)
@@ -604,6 +619,7 @@ async function handleInbound(ctx: any, text: string, dl?: () => Promise<string |
   if (perm && clients.has(s.key)) {
     const behavior = perm[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny'
     pushTo(s.key, { event: 'permission', request_id: perm[2]!.toLowerCase(), behavior })
+    permOwner.delete(perm[2]!.toLowerCase()); touchStatus(s.key)
     void bot.api.setMessageReaction(GROUP, msgId, [{ type: 'emoji', emoji: (behavior === 'allow' ? '✅' : '❌') as ReactionTypeEmoji['emoji'] }]).catch(() => {})
     return
   }
@@ -848,6 +864,7 @@ function mirrorTick() {
           if (t.startsWith('<') || t.startsWith('[Request interrupted') || t.startsWith('Caveat:')) continue
           m.mode = 'term'
           mirrorSend(key, `🖥 Из терминала:\n${t}`)
+          actStart(key)
         } else if (e?.type === 'assistant' && m.mode === 'term' && Array.isArray(e.message?.content)) {
           for (const b of e.message.content) if (b?.type === 'text' && String(b.text ?? '').trim()) mirrorSend(key, `🤖 ${String(b.text).trim()}`)
         }
@@ -878,7 +895,8 @@ function queueRename(key: string) { if (!renameQueue.includes(key)) renameQueue.
 setInterval(() => {
   const key = renameQueue.shift()
   const s = key ? sessions[key] : undefined
-  if (!key || !s || clients.get(key)?.general) return
+  if (!key || !s || key === generalKey || clients.get(key)?.general) return
+  sentStatus.set(key, computeStatus(key))
   bot.api.editForumTopic(GROUP, s.thread_id, { name: topicTitle(s) }).catch(e => {
     const m = /retry after (\d+)/.exec(String(e))
     if (m) { renameQueue.unshift(key); setTimeout(() => {}, 0) }
@@ -889,6 +907,7 @@ function refreshModels() {
   for (const key of clients.keys()) {
     const s = sessions[key]
     if (!s || clients.get(key)?.general) continue
+    touchStatus(key)
     const id = readModel(s.dir)
     if (!id) continue
     const short = modelShort(id)
@@ -1151,7 +1170,7 @@ bot.on('callback_query:data', async ctx => {
   }
   const owner = permOwner.get(id)
   if (owner) pushTo(owner, { event: 'permission', request_id: id, behavior })
-  permOwner.delete(id); permDetails.delete(id)
+  permOwner.delete(id); permDetails.delete(id); if (owner) touchStatus(owner)
   const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
   await ctx.answerCallbackQuery({ text: label }).catch(() => {})
   const msg = ctx.callbackQuery.message

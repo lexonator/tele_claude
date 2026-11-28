@@ -98,7 +98,7 @@ test('две сессии получают разные темы, сообщен
   const rb = await b.call({ op: 'register', key: '/p/b::main', name: 'main', dir: '/p/b' })
   expect(ra.ok && rb.ok).toBe(true)
   expect(ra.result.thread_id).not.toBe(rb.result.thread_id)
-  expect(ra.result.title).toBe('a')
+  expect(ra.result.title).toBe('🟢 a')
 
   updates.push(fakeUpdate('привет A', ra.result.thread_id))
   updates.push(fakeUpdate('привет B', rb.result.thread_id))
@@ -151,7 +151,7 @@ test('/sessions в общей теме отвечает списком', async (
   updates.push(fakeUpdate('/sessions'))
   await Bun.sleep(600)
   const m = calls.find(x => x.method === 'sendMessage')
-  expect(m?.body.text).toMatch(/(🟢|⚪️) a(\n|$)/)
+  expect(m?.body.text).toContain(' a\n')
 })
 
 test('статус: читает журнал сессии, показывает действия и снимает по end_turn', async () => {
@@ -226,4 +226,15 @@ test('зеркало: набранное в терминале дублируе�
   appendFileSync(tr, U('<channel source="tele" chat_id="1">из телеги</channel>') + A('этот ответ уже ушёл через reply'))
   await Bun.sleep(3500)
   expect(texts().some(t => t.includes('из телеги') || t.includes('уже ушёл'))).toBe(false)
+}, 20000)
+
+test('состояние сессии в названии темы: 🟢 свободна, 🔵 работает', async () => {
+  const c = await TestClient.open()
+  const r = await c.call({ op: 'register', key: '/p/z::main', name: 'main', dir: '/p/z' })
+  await Bun.sleep(3200)
+  const names = () => calls.filter(x => x.method === 'editForumTopic' && x.body.message_thread_id === r.result.thread_id).map(x => String(x.body.name))
+  expect(names().some(n => n.startsWith('🟢 z'))).toBe(true)
+  updates.push(fakeUpdate('работай', r.result.thread_id))
+  await Bun.sleep(3500)
+  expect(names().some(n => n.startsWith('🔵 z'))).toBe(true)
 }, 20000)

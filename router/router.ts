@@ -616,6 +616,7 @@ async function handleInbound(ctx: any, text: string, dl?: () => Promise<string |
     const key = keyFor(tid)
     const opts = tid != null ? { message_thread_id: tid } : {}
     const msg = key && clients.has(key) ? interrupt(key) : 'Для этой темы нет запущенной сессии.'
+    if (key) actStop(key, 'int')
     return void (await bot.api.sendMessage(GROUP, msg, opts).catch(() => {}))
   }
   if (/^\/(screen|browser)(@\w+)?(\s|$)/i.test(text)) {
@@ -1157,7 +1158,9 @@ bot.on('callback_query:data', async ctx => {
     if (!isAllowed(ctx.from.id)) return void ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
     const ref = ctx.callbackQuery.data.slice(5)
     const key = keyFor(ref === 'g' ? undefined : Number(ref))
-    return void ctx.answerCallbackQuery({ text: key && clients.has(key) ? interrupt(key) : 'Сессия не запущена' }).catch(() => {})
+    const note = key && clients.has(key) ? interrupt(key) : 'Сессия не запущена'
+    if (key) actStop(key, 'int') // строка статуса уходит сразу
+    return void ctx.answerCallbackQuery({ text: note }).catch(() => {})
   }
   if (ctx.callbackQuery.data.startsWith('md:')) {
     if (!isAllowed(ctx.from.id)) return void ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})

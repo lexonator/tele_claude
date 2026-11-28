@@ -275,3 +275,16 @@ test('/statusemoji запоминает анимированный эмодзи,
   const st = calls.find(x => x.method === 'sendMessage' && String(x.body.text).startsWith('🔵'))
   expect(JSON.stringify(st?.body.entities)).toContain('123456')
 }, 20000)
+
+test('кнопка «Прервать»: строка статуса удаляется сразу', async () => {
+  const c = await TestClient.open()
+  const r = await c.call({ op: 'register', key: '/p/s::main', name: 'main', dir: '/p/s' })
+  updates.push(fakeUpdate('работай', r.result.thread_id))
+  await c.waitEvent()
+  await Bun.sleep(1500)
+  calls.length = 0
+  updates.push({ update_id: 8, callback_query: { id: 'c2', chat_instance: 'x', data: `stop:${r.result.thread_id}`, from: { id: USER, is_bot: false, first_name: 'u' },
+    message: { message_id: 6, date: 1, chat: { id: Number(GROUP), type: 'supergroup' }, text: 'x' } } })
+  await Bun.sleep(800)
+  expect(calls.some(x => x.method === 'deleteMessage')).toBe(true)
+}, 20000)

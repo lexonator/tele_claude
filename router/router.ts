@@ -869,7 +869,7 @@ function mirrorText(content: unknown): string {
   return content.filter((b: any) => b?.type === 'text').map((b: any) => b.text).join('\n')
 }
 function mirrorTick() {
-  if (!mirrorOn()) { mirrors.clear(); return }
+  const on = mirrorOn()
   for (const key of clients.keys()) {
     try {
       const dir = key.split('::')[0]!
@@ -883,9 +883,18 @@ function mirrorTick() {
       const fd = openSync(file, 'r'); const buf = Buffer.alloc(Math.min(size - m.offset, 1 << 20))
       readSync(fd, buf, 0, buf.length, m.offset); closeSync(fd); m.offset += buf.length
       const lines = (m.rest + buf.toString('utf8')).split('\n'); m.rest = lines.pop() ?? ''
+      let busy: boolean | undefined, what: string | undefined
       for (const line of lines) {
         let e: any; try { e = JSON.parse(line) } catch { continue }
         if (e?.isSidechain || e?.isMeta) continue
+        // Видим, что сессия работает, даже если задание дали не через Telegram (терминал, цикл, подагенты).
+        if (e?.type === 'assistant') {
+          busy = e.message?.stop_reason === 'end_turn' ? false : true
+          for (const b of Array.isArray(e.message?.content) ? e.message.content : []) if (b?.type === 'tool_use') what = describeTool(b.name, b.input) ?? what
+        }
+        else if (e?.type === 'user' && Array.isArray(e.message?.content) && e.message.content.some((b: any) => b?.type === 'tool_result')) busy = true
+        else if (e?.type === 'user' && JSON.stringify(e.message?.content ?? '').includes('Request interrupted')) busy = false
+        if (!on) continue
         if (e?.type === 'user') {
           const t = mirrorText(e.message?.content).trim()
           if (!t) continue
@@ -898,6 +907,7 @@ function mirrorTick() {
           for (const b of e.message.content) if (b?.type === 'text' && String(b.text ?? '').trim()) mirrorSend(key, `🤖 ${String(b.text).trim()}`)
         }
       }
+      if (busy && !activity.has(key)) actStart(key, what ?? '💭 Думаю…')
     } catch {}
   }
 }

@@ -248,3 +248,16 @@ test('статус: внизу темы всегда «хвост» — посл
   await Bun.sleep(1500)
   expect(calls.some(x => x.method === 'deleteMessage')).toBe(true) // «хвост» убран
 }, 20000)
+
+test('сессия работает без задания из Telegram: статус и «печатает» всё равно появляются', async () => {
+  const c = await TestClient.open()
+  const r = await c.call({ op: 'register', key: '/p/v::main', name: 'main', dir: '/p/v' })
+  const pd = join(dir, 'projects', '-p-v'); mkdirSync(pd, { recursive: true })
+  const tr = join(pd, 's1.jsonl'); writeFileSync(tr, '')
+  await Bun.sleep(2200)
+  calls.length = 0
+  appendFileSync(tr, JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/p/v/x.ts' } }] } }) + '\n')
+  await Bun.sleep(3500)
+  expect(calls.some(x => x.method === 'sendChatAction' && x.body.message_thread_id === r.result.thread_id)).toBe(true)
+  expect(calls.some(x => x.method === 'sendMessage' && x.body.message_thread_id === r.result.thread_id && String(x.body.text).includes('Читаю x.ts'))).toBe(true)
+}, 20000)

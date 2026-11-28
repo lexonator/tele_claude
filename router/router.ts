@@ -139,7 +139,7 @@ function assertSendable(f: string) {
 }
 
 // ---------- «живой» статус сессии: анимация печати и что она сейчас делает ----------
-type Act = { watch?: ReturnType<typeof setInterval>; hooked?: boolean; thread?: number; typing: ReturnType<typeof setInterval>; kill: ReturnType<typeof setTimeout>; msgId?: number; text: string; lastEdit: number; pending?: string; frame?: number; bumpAt?: number; bumpT?: ReturnType<typeof setTimeout> }
+type Act = { watch?: ReturnType<typeof setInterval>; hooked?: boolean; thread?: number; typing: ReturnType<typeof setInterval>; kill: ReturnType<typeof setTimeout>; msgId?: number; text: string; lastEdit: number; pending?: string; frame?: number; started?: number; lastTool?: string; oldMsg?: number; bumpAt?: number; bumpT?: ReturnType<typeof setTimeout> }
 const activity = new Map<string, Act>()
 
 // Номера сообщений-статусов храним на диске: если роутер перезапустят посреди работы,
@@ -166,14 +166,22 @@ try { statusEmojiId = readFileSync(EMOJI_FILE, 'utf8').trim() } catch {}
 const noVS = (x: string) => x.replace(/\uFE0F/g, '')
 const iconIds = new Map<string, string>() // эмодзи -> custom_emoji_id
 void bot.api.getForumTopicIconStickers().then(r => { if (Array.isArray(r)) for (const st of r) if (st.emoji && st.custom_emoji_id) iconIds.set(noVS(st.emoji), st.custom_emoji_id) }).catch(() => {})
-// эмодзи в тексте статуса -> эмодзи из набора значков
-const ACT_ICON: Array<[string, string]> = [['📖', '📚'], ['✏️', '✍️'], ['📝', '📝'], ['⚙️', '💻'], ['🔎', '🔎'], ['🌐', '🔭'], ['🤖', '🤖'], ['📋', '✅'], ['🔧', '⚡️'], ['💭', '🧠'], ['🟡', '❓'], ['🔐', '❗️'], ['❓', '❓']]
-// Без своего значка: анимированные точки «•••» рядом с сообщением рисует сам Telegram («печатает…»), лишние картинки не нужны.
+// Значок активности — анимированный эмодзи из набора значков тем Telegram; обычных эмодзи рядом с ним не пишем.
+const stripLead = (x: string) => x.replace(/^(?:\p{Extended_Pictographic}️?\s*)+/u, '')
+const ACT_ICON: Array<[string, string]> = [['📖', '👀'], ['✏️', '✍️'], ['📝', '📝'], ['⚙️', '💻'], ['🔎', '🔎'], ['🌐', '🔭'], ['🤖', '🤖'], ['📋', '✅'], ['🔧', '⚡️'], ['💭', '💬'], ['🟡', '❓'], ['🔐', '❗️'], ['❓', '❓'], ['✍️', '✍️']]
+const elapsed = (a: Act) => { const s = Math.max(0, Math.round((Date.now() - (a.started ?? Date.now())) / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}` }
 function renderStatusMsg(key: string, a: Act): { text: string; entities?: Array<{ type: 'custom_emoji'; offset: number; length: number; custom_emoji_id: string }> } {
-  const tail = modelTail(key)
-  if (statusEmojiId) return { text: `${SPIN[0]} ${a.text.replace(/^\p{Extended_Pictographic}\uFE0F?\s*/u, '')}${tail}`, entities: [{ type: 'custom_emoji', offset: 0, length: 2, custom_emoji_id: statusEmojiId }] }
-  return { text: `${a.text.replace(/^\p{Extended_Pictographic}\uFE0F?\s*/u, '')}${tail}` }
+  const tail = `${modelTail(key)} · ${elapsed(a)}`
+  const rest = stripLead(a.text)
+  if (statusEmojiId) return { text: `${SPIN[0]} ${rest}${tail}`, entities: [{ type: 'custom_emoji', offset: 0, length: 2, custom_emoji_id: statusEmojiId }] }
+  const hit = ACT_ICON.find(([from]) => noVS(a.text).startsWith(noVS(from)))
+  if (!hit) return { text: `${rest}${tail}` }
+  const ch = hit[1], id = iconIds.get(noVS(ch))
+  return id
+    ? { text: `${ch} ${rest}${tail}`, entities: [{ type: 'custom_emoji', offset: 0, length: ch.length, custom_emoji_id: id }] }
+    : { text: `${rest}${tail}` }
 }
+setInterval(() => { for (const [key, a] of activity) if (a.msgId != null && a.msgId > 0) flushStatus(key) }, 3000)
 
 // Сообщение-«хвост», когда сессия не работает: стоит в самом низу темы и уходит, когда начинается новая работа.
 const restMsgs = new Map<string, number>()
@@ -197,9 +205,9 @@ function bumpStatus(key: string) {
   if (!a || a.msgId == null || a.msgId < 0) return
   if (Date.now() - (a.bumpAt ?? 0) < 1600) { if (!a.bumpT) a.bumpT = setTimeout(() => { a.bumpT = undefined; bumpStatus(key) }, 1700); return }
   a.bumpAt = Date.now()
-  const old = a.msgId, text = a.text
+  const text = a.text
+  a.oldMsg = a.msgId // старое удалим, только когда новое уже появилось
   a.msgId = undefined; a.text = ''
-  void bot.api.deleteMessage(GROUP, old).catch(() => {})
   actSet(key, text)
 }
 
@@ -213,7 +221,7 @@ function actStart(key: string, text = '💭 Думаю…') {
   const thread = threadForKey(key)
   const typing = setInterval(() => void bot.api.sendChatAction(GROUP, 'typing', withThread(thread)).catch(() => {}), 4000)
   const kill = setTimeout(() => actStop(key), 15 * 60_000) // страховка, если «стоп» не пришёл
-  const a: Act = { thread, typing, kill, text: '', lastEdit: 0, hooked: true }
+  const a: Act = { thread, typing, kill, text: '', lastEdit: 0, hooked: true, started: Date.now() }
   activity.set(key, a)
   touchStatus(key)
   a.watch = watchTranscript(key)
@@ -233,10 +241,14 @@ function actSet(key: string, text: string) {
     void bot.api.sendMessage(GROUP, renderStatusMsg(key, a).text, { ...withThread(a.thread), entities: renderStatusMsg(key, a).entities, disable_notification: true, reply_markup: stopKb(a.thread != null ? String(a.thread) : 'g') })
       .then(m => {
         const cur = activity.get(key)
-        if (cur === a) { a.msgId = m.message_id; statusMsgs[key] = m.message_id; saveStatus(); if (a.text !== text) flushStatus(key) }
+        if (cur === a) {
+          a.msgId = m.message_id; statusMsgs[key] = m.message_id; saveStatus()
+          if (a.oldMsg != null) { void bot.api.deleteMessage(GROUP, a.oldMsg).catch(() => {}); a.oldMsg = undefined }
+          if (a.text !== text) flushStatus(key)
+        }
         else void bot.api.deleteMessage(GROUP, m.message_id).catch(() => {})
       })
-      .catch(e => { log(`статус: sendMessage не удался: ${e}`); if (activity.get(key) === a) a.msgId = undefined })
+      .catch(e => { log(`статус: sendMessage не удался: ${e}`); if (activity.get(key) === a) { a.msgId = a.oldMsg; a.oldMsg = undefined } })
     return
   }
   if (a.msgId < 0 || now - a.lastEdit < 1500) {
@@ -294,8 +306,9 @@ function watchTranscript(key: string): ReturnType<typeof setInterval> {
         const msg = e?.message
         if (e?.type === 'assistant' && Array.isArray(msg?.content)) {
           for (const b of msg.content) {
-            if (b.type === 'tool_use' && b.name === 'AskUserQuestion') { actSet(key, '❓ Жду вашего ответа'); askShow(key, String(b.id), b.input) }
-            else if (b.type === 'tool_use') { const d = describeTool(b.name, b.input); if (d) actSet(key, d) }
+            if (b.type === 'text' && String(b.text ?? '').trim()) actSet(key, '✍️ Пишу ответ: ' + String(b.text).replace(/\s+/g, ' ').trim().slice(0, 140))
+            else if (b.type === 'tool_use' && b.name === 'AskUserQuestion') { actSet(key, '❓ Жду вашего ответа'); askShow(key, String(b.id), b.input) }
+            else if (b.type === 'tool_use') { const d = describeTool(b.name, b.input); if (d) { const a0 = activity.get(key); if (a0) a0.lastTool = d; actSet(key, d) } }
             else if (b.type === 'thinking' && b.thinking) actSet(key, '💭 ' + String(b.thinking).replace(/\s+/g, ' ').trim().slice(-240))
           }
           if (msg.stop_reason === 'end_turn') actStop(key)
@@ -304,6 +317,8 @@ function watchTranscript(key: string): ReturnType<typeof setInterval> {
         } else if (e?.type === 'user' && Array.isArray(msg?.content) && msg.content.some((b: any) => b.type === 'tool_result')) {
           // результат инструмента получен — модель снова думает (если не пришло ничего нового, строка останется как есть)
           for (const b of msg.content) if (b.type === 'tool_result') askDone(String(b.tool_use_id))
+          const a1 = activity.get(key)
+          if (a1?.lastTool) actSet(key, '💭 Разбираю результат: ' + stripLead(a1.lastTool).slice(0, 110))
         }
       }
     } catch {}
@@ -317,6 +332,7 @@ function actStop(key: string, rest: 'idle' | 'int' | 'off' = 'idle') {
   if (a.bumpT) clearTimeout(a.bumpT)
   clearInterval(a.typing); clearTimeout(a.kill); if (a.watch) clearInterval(a.watch)
   if (a.msgId != null && a.msgId > 0) void bot.api.deleteMessage(GROUP, a.msgId).catch(() => {})
+  if (a.oldMsg != null) void bot.api.deleteMessage(GROUP, a.oldMsg).catch(() => {})
   if (statusMsgs[key] != null) { delete statusMsgs[key]; saveStatus() }
 }
 

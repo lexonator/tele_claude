@@ -162,8 +162,21 @@ const modelTail = (key: string) => (sessions[key]?.model ? ` · ${sessions[key]!
 const EMOJI_FILE = join(STATE_DIR, 'status-emoji.id')
 let statusEmojiId = ''
 try { statusEmojiId = readFileSync(EMOJI_FILE, 'utf8').trim() } catch {}
-const statusEntities = () => (statusEmojiId ? { entities: [{ type: 'custom_emoji' as const, offset: 0, length: 2, custom_emoji_id: statusEmojiId }] } : {})
-const renderStatus = (key: string, a: Act) => `${SPIN[(a.frame ?? 0) % SPIN.length]} ${a.text}${modelTail(key)}`
+// Анимированные эмодзи под вид активности: берём из набора значков тем Telegram (они доступны ботам, многие анимированы).
+const noVS = (x: string) => x.replace(/\uFE0F/g, '')
+const iconIds = new Map<string, string>() // эмодзи -> custom_emoji_id
+void bot.api.getForumTopicIconStickers().then(r => { if (Array.isArray(r)) for (const st of r) if (st.emoji && st.custom_emoji_id) iconIds.set(noVS(st.emoji), st.custom_emoji_id) }).catch(() => {})
+// эмодзи в тексте статуса -> эмодзи из набора значков
+const ACT_ICON: Array<[string, string]> = [['📖', '📚'], ['✏️', '✍️'], ['📝', '📝'], ['⚙️', '💻'], ['🔎', '🔎'], ['🌐', '🔭'], ['🤖', '🤖'], ['📋', '✅'], ['🔧', '⚡️'], ['💭', '🧠'], ['🟡', '❓'], ['🔐', '❗️'], ['❓', '❓']]
+function renderStatusMsg(key: string, a: Act): { text: string; entities?: Array<{ type: 'custom_emoji'; offset: number; length: number; custom_emoji_id: string }> } {
+  const tail = modelTail(key)
+  if (statusEmojiId) return { text: `${SPIN[0]} ${a.text}${tail}`, entities: [{ type: 'custom_emoji', offset: 0, length: 2, custom_emoji_id: statusEmojiId }] }
+  const hit = ACT_ICON.find(([from]) => noVS(a.text).startsWith(noVS(from)))
+  if (!hit) return { text: `${SPIN[0]} ${a.text}${tail}` }
+  const rest = a.text.slice(hit[0].length).trim()
+  const ch = hit[1], id = iconIds.get(noVS(ch))
+  return { text: `${ch} ${rest}${tail}`, ...(id ? { entities: [{ type: 'custom_emoji' as const, offset: 0, length: ch.length, custom_emoji_id: id }] } : {}) }
+}
 
 // Сообщение-«хвост», когда сессия не работает: стоит в самом низу темы и уходит, когда начинается новая работа.
 const restMsgs = new Map<string, number>()
@@ -220,7 +233,7 @@ function actSet(key: string, text: string) {
   if (a.msgId == null) {
     a.lastEdit = now
     a.msgId = -1 // занято: сообщение создаётся
-    void bot.api.sendMessage(GROUP, renderStatus(key, a), { ...withThread(a.thread), ...statusEntities(), disable_notification: true, reply_markup: stopKb(a.thread != null ? String(a.thread) : 'g') })
+    void bot.api.sendMessage(GROUP, renderStatusMsg(key, a).text, { ...withThread(a.thread), entities: renderStatusMsg(key, a).entities, disable_notification: true, reply_markup: stopKb(a.thread != null ? String(a.thread) : 'g') })
       .then(m => {
         const cur = activity.get(key)
         if (cur === a) { a.msgId = m.message_id; statusMsgs[key] = m.message_id; saveStatus(); if (a.text !== text) flushStatus(key) }
@@ -243,7 +256,7 @@ function flushStatus(key: string) {
   if (Date.now() - a.lastEdit < 1500) return
   a.lastEdit = Date.now()
   a.pending = undefined
-  void bot.api.editMessageText(GROUP, a.msgId, renderStatus(key, a), { ...statusEntities(), reply_markup: stopKb(a.thread != null ? String(a.thread) : 'g') }).catch(e => { if (!/not modified/i.test(String(e))) log(`статус: edit не удался: ${e}`) })
+  void bot.api.editMessageText(GROUP, a.msgId, renderStatusMsg(key, a).text, { entities: renderStatusMsg(key, a).entities, reply_markup: stopKb(a.thread != null ? String(a.thread) : 'g') }).catch(e => { if (!/not modified/i.test(String(e))) log(`статус: edit не удался: ${e}`) })
 }
 
 // Читаем «хвост» журнала сессии Claude Code (jsonl): оттуда видно, какие инструменты вызываются,

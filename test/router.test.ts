@@ -43,6 +43,7 @@ beforeAll(async () => {
           if (updates.length === 0) { await Bun.sleep(150); return ok([]) }
           const r = updates; updates = []; return ok(r)
         }
+        case 'getForumTopicIconStickers': return ok([{ emoji: '📚', custom_emoji_id: '9001' }, { emoji: '🧠', custom_emoji_id: '9002' }])
         case 'createForumTopic': return ok({ message_thread_id: nextThread++, name: body.name })
         case 'sendMessage': return ok({ message_id: nextMsg++, date: 1, chat: { id: Number(GROUP), type: 'supergroup' } })
         default: return ok(true)
@@ -166,6 +167,9 @@ test('статус: читает журнал сессии, показывает
   await Bun.sleep(2500)
   const texts = calls.filter(x => x.method === 'sendMessage' || x.method === 'editMessageText').map(x => x.body.text)
   expect(texts.some(t => String(t).includes('Читаю a.ts'))).toBe(true)
+  const withIcon = calls.find(x => (x.method === 'sendMessage' || x.method === 'editMessageText') && String(x.body.text).includes('Читаю a.ts'))!
+  expect(String(withIcon.body.text).startsWith('📚')).toBe(true)
+  expect(JSON.stringify(withIcon.body.entities)).toContain('9001')
   appendFileSync(tr, JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn' } }) + '\n')
   await Bun.sleep(1500)
   expect(calls.some(x => x.method === 'deleteMessage')).toBe(true)

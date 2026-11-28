@@ -448,9 +448,7 @@ async function handleOp(c: Client, m: Msg): Promise<unknown> {
       return { ids }
     }
     case 'react': {
-      await bot.api.setMessageReaction(GROUP, Number(m.message_id), [
-        { type: 'emoji', emoji: String(m.emoji) as ReactionTypeEmoji['emoji'] },
-      ])
+      // Реакции («лайки») отключены: ничего не ставим, но сессии отвечаем, что всё в порядке.
       return {}
     }
     case 'edit': {
@@ -658,7 +656,6 @@ async function handleInbound(ctx: any, text: string, dl?: () => Promise<string |
     const behavior = perm[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny'
     pushTo(s.key, { event: 'permission', request_id: perm[2]!.toLowerCase(), behavior })
     permOwner.delete(perm[2]!.toLowerCase()); touchStatus(s.key)
-    void bot.api.setMessageReaction(GROUP, msgId, [{ type: 'emoji', emoji: (behavior === 'allow' ? '✅' : '❌') as ReactionTypeEmoji['emoji'] }]).catch(() => {})
     return
   }
 

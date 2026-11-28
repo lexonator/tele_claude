@@ -197,7 +197,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'react',
-      description: 'Add an emoji reaction to a Telegram message. Telegram only accepts a fixed whitelist (👍 👎 ❤ 🔥 👀 🎉 etc) — non-whitelisted emoji will be rejected.',
+      description: 'Reactions are disabled in this setup (the user does not want likes/emoji on messages): calling this does nothing. Do not use it; answer with reply instead.',
       inputSchema: {
         type: 'object',
         properties: { chat_id: { type: 'string' }, message_id: { type: 'string' }, emoji: { type: 'string' } },

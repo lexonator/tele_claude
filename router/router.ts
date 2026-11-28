@@ -519,6 +519,15 @@ async function handleInbound(ctx: any, text: string, dl?: () => Promise<string |
   const isDm = chatType === 'private'
   if (!isGroup && !isDm) return
 
+  const rn = /^\/rename(@\w+)?\s+(.+)$/is.exec(text.trim())
+  if (rn) {
+    const say = (t: string) => bot.api.sendMessage(GROUP, t, withThread(tid)).catch(() => {})
+    if (tid == null) return void (await say('Переименовать можно тему сессии: напишите /rename Новое название внутри неё. Общую тему General Telegram переименовать не даёт.'))
+    const title = rn[2]!.trim().slice(0, 128)
+    try { await bot.api.editForumTopic(GROUP, tid, { name: title }); return void (await say(`Переименовал: «${title}»`)) }
+    catch (e) { return void (await say(`Не получилось переименовать: ${e}`)) }
+  }
+  if (/^\/rename(@\w+)?\s*$/i.test(text.trim())) return void (await bot.api.sendMessage(GROUP, 'Напишите новое название: /rename Новое название. Или переименуйте тему вручную (нажмите на название темы сверху → «Изменить»): бот это название не трогает.', withThread(tid)).catch(() => {}))
   if (/^\/new(@\w+)?(\s|$)/i.test(text)) return void (await newCommand(Number(ctx.chat.id), tid))
   if (!text.startsWith('/') && !att && !dl && newFlow?.awaitName && (tid ?? undefined) === newFlow.thread && await newFolderName(text)) return
 
@@ -697,8 +706,17 @@ async function newLaunch(dir: string, resume: boolean): Promise<string> {
   const cmd = `${shq(join(ROOT_DIR, 'bin', 'tele-claude'))} ${shq(dir)}${sid ? ' --resume ' + sid : ''}`
   const r = tmux('new-session', '-d', '-s', name, '-x', '200', '-y', '50', '-c', dir, cmd)
   if (r.status !== 0) return `Не получилось запустить: ${(r.stderr || '').trim().slice(0, 200)}`
-  await Bun.sleep(8000)
-  tmux('send-keys', '-t', name, 'Enter') // подтверждение вопроса про dev-канал
+  // Отвечаем на стартовые вопросы Claude Code по тому, что видно на экране (вслепую Enter мог выбрать «Нет, выйти»).
+  let seenChannel = false
+  for (let i = 0; i < 40; i++) {
+    await Bun.sleep(1500)
+    if (!teleTmuxSessions().includes(name)) return 'Сессия сразу закрылась. Запустите вручную и посмотрите, что пишет: tele-claude ' + dir
+    const scr = tmux('capture-pane', '-p', '-t', name).stdout ?? ''
+    if (/trust this folder/.test(scr)) tmux('send-keys', '-t', name, 'Down', 'Enter') // курсор стоит на «No, exit»
+    else if (/I am using this for local development/.test(scr)) { tmux('send-keys', '-t', name, 'Enter'); seenChannel = true }
+    else if (seenChannel) break
+    else if (/\? for shortcuts|bypass permissions|auto mode on/.test(scr)) break
+  }
   return `Запустил ${dir.replace(HOME, '~')}${sid ? ' (с прежним контекстом)' : ''}. Тема «${dir.split('/').pop()} — main» появится в группе через пару секунд. Окно: /show ${name.replace(/^tele-/, '')}`
 }
 
@@ -849,7 +867,7 @@ async function serviceCommand(ctx: any, text: string, tid?: number) {
       : 'Сессий пока нет.'
     await bot.api.sendMessage(chatId, lines + '\n\n🟢 запущена, ⚪️ не запущена', opts)
   } else {
-    await bot.api.sendMessage(chatId, 'У каждой сессии Claude Code своя тема. Пишите в тему, и сообщение попадёт только в эту сессию.\n\n/new — запустить сессию в нужной папке (по шагам)\n/windows — окна кнопками\n/sessions — список сессий\n/show <имя> — открыть окно терминала с сессией (в теме сессии имя не нужно)\n/hide <имя> — скрыть окно, сессия продолжит работать\n/hideall — скрыть все окна', opts)
+    await bot.api.sendMessage(chatId, 'У каждой сессии Claude Code своя тема. Пишите в тему, и сообщение попадёт только в эту сессию.\n\n/rename <название> — переименовать тему\n/new — запустить сессию в нужной папке (по шагам)\n/windows — окна кнопками\n/sessions — список сессий\n/show <имя> — открыть окно терминала с сессией (в теме сессии имя не нужно)\n/hide <имя> — скрыть окно, сессия продолжит работать\n/hideall — скрыть все окна', opts)
   }
 }
 
@@ -973,6 +991,7 @@ for (let attempt = 1; !stopping; attempt++) {
       onStart: info => {
         attempt = 0; botUsername = info.username; log(`polling as @${info.username}`)
         const cmds = [
+          { command: 'rename', description: 'Переименовать эту тему: /rename Название' },
           { command: 'new', description: 'Запустить новую сессию: выбрать или создать папку' },
           { command: 'stop', description: 'Прервать текущее действие сессии (как Esc)' },
           { command: 'screen', description: 'Браузер сессии: скриншот и кнопки управления' },

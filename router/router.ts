@@ -294,7 +294,37 @@ function newestTranscript(dir: string): string | undefined {
 }
 
 // Фоновые агенты сессии: их журналы лежат в <журнал сессии>/subagents/*.jsonl; свежий файл = агент работает.
-function subAgents(key: string): { n: number; what?: string } {
+const bgCache = new Map<string, { t: number; v: { n: number; label: string } }>()
+// Фоновые команды, мониторы и агенты видны в подвале экрана Claude Code («1 shell, 1 monitor»).
+function bgFooter(key: string): { n: number; label: string } {
+  const c = bgCache.get(key)
+  if (c && Date.now() - c.t < 5000) return c.v
+  let v = { n: 0, label: '' }
+  try {
+    const r = tmux('capture-pane', '-p', '-t', tmuxNameFor({ dir: key.split('::')[0]! }))
+    const lines = (r.stdout ?? '').split('\n').map(x => x.trimEnd()).filter(x => x.trim()).slice(-4)
+    const names: Record<string, [string, string, string]> = { shell: ['команда', 'команды', 'команд'], monitor: ['монитор', 'монитора', 'мониторов'], agent: ['агент', 'агента', 'агентов'], workflow: ['сценарий', 'сценария', 'сценариев'], task: ['задача', 'задачи', 'задач'] }
+    const parts: string[] = []
+    for (const ln of lines) {
+      if (!/⏵|still running/.test(ln)) continue
+      for (const m of ln.matchAll(/(\d+) (?:local )?(shell|monitor|agent|workflow|task)s?\b/gi)) {
+        const k = m[2]!.toLowerCase(), num = Number(m[1]), f = names[k]!
+        const w = num % 10 === 1 && num % 100 !== 11 ? f[0] : [2, 3, 4].includes(num % 10) && ![12, 13, 14].includes(num % 100) ? f[1] : f[2]
+        if (!parts.some(x => x.endsWith(' ' + f[0]) || x.endsWith(' ' + f[1]) || x.endsWith(' ' + f[2]))) { parts.push(`${num} ${w}`); v.n += num }
+      }
+      if (parts.length) break
+    }
+    v.label = parts.join(', ')
+  } catch {}
+  bgCache.set(key, { t: Date.now(), v })
+  return v
+}
+function subAgents(key: string): { n: number; what?: string; label?: string } {
+  const bg = bgFooter(key)
+  const j = subAgentsJournal(key)
+  return { n: j.n + bg.n, what: j.what, label: bg.label || (j.n ? `агентов ${j.n}` : '') }
+}
+function subAgentsJournal(key: string): { n: number; what?: string } {
   try {
     const f = newestTranscript(key.split('::')[0]!)
     if (!f) return { n: 0 }
@@ -321,9 +351,9 @@ function subAgents(key: string): { n: number; what?: string } {
     return { n, what }
   } catch { return { n: 0 } }
 }
-function subText(sa: { n: number; what?: string }): string {
+function subText(sa: { n: number; what?: string; label?: string }): string {
   const w = sa.what ? sa.what.replace(/^\S+\s/u, '') : ''
-  return `🤖 Фоновые агенты работают: ${sa.n}${w ? ' · ' + w : ''}`
+  return `🤖 Работает в фоне: ${sa.label || sa.n}${w ? ' · ' + w : ''}`
 }
 
 function watchTranscript(key: string): ReturnType<typeof setInterval> {
@@ -956,8 +986,8 @@ function mirrorTick() {
       if (m.file !== file) { m.file = file; m.offset = 0; m.rest = '' } // новый файл журнала читаем с начала
       { // фоновые агенты: показываем, пока они работают, и снимаем статус, когда затихли
         const sa = subAgents(key), act = activity.get(key)
-        if (sa.n) { if (!act) actStart(key, subText(sa)); else if (m.sub || /^🤖 Фоновые/.test(act.text)) actSet(key, subText(sa)); m.sub = true }
-        else if (m.sub) { m.sub = false; if (activity.get(key) && /^🤖 Фоновые/.test(activity.get(key)!.text)) actStop(key) }
+        if (sa.n) { if (!act) actStart(key, subText(sa)); else if (m.sub || /^🤖 Работает в фоне/.test(act.text)) actSet(key, subText(sa)); m.sub = true }
+        else if (m.sub) { m.sub = false; if (activity.get(key) && /^🤖 Работает в фоне/.test(activity.get(key)!.text)) actStop(key) }
       }
       const size = statSync(file).size
       if (size <= m.offset) continue

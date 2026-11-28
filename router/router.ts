@@ -819,7 +819,7 @@ function resolveWindow(arg: string, tid?: number): { name?: string; error?: stri
   return all.includes(name) ? { name } : { error: `У этой сессии нет tmux-окна (${name}). Она запущена не через tmux.` }
 }
 // ---------- /new: пошаговый запуск сессии в нужной папке ----------
-type NewFlow = { chat: number; thread?: number; dirs: string[]; dir?: string; awaitName?: boolean }
+type NewFlow = { chat: number; thread?: number; dirs: string[]; dir?: string; awaitName?: boolean; resume?: boolean; opts?: ModelOpt[] }
 let newFlow: NewFlow | undefined
 const shq = (x: string) => `'${x.replace(/'/g, `'\\''`)}'`
 const fmtDate = (ms: number) => new Date(ms).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
@@ -869,6 +869,29 @@ function newModePanel(dir: string): { text: string; kb: InlineKeyboard } {
   return { text, kb }
 }
 
+function newModelPanel(f: NewFlow): { text: string; kb: InlineKeyboard } {
+  const opts = [...CLOUD_MODELS, ...localModels()]
+  f.opts = opts
+  const kb = new InlineKeyboard().text('⭐ По умолчанию', 'nw:m:d').row()
+  opts.forEach((o, i) => { kb.text(`${o.local ? '🏠' : '☁️'} ${o.label}`, `nw:m:${i}`); if (i % 2 === 1 || i === CLOUD_MODELS.length - 1) kb.row() })
+  kb.row().text('✖️ Отмена', 'nw:x')
+  return { text: `Шаг 3. Папка ${f.dir!.replace(HOME, '~')}. На какой модели запустить?\n☁️ Claude · 🏠 локальные (Ollama, нужен включённый Мак). «По умолчанию» берёт обычную модель Claude Code.`, kb }
+}
+
+async function newLaunchWith(f: NewFlow, opt?: ModelOpt): Promise<string> {
+  const dir = f.dir!
+  if (opt?.local && spawnSync('curl', ['-sf', '-m', '3', 'http://127.0.0.1:11434/api/version']).status !== 0) {
+    spawnSync('open', ['-a', 'Ollama']); await Bun.sleep(6000)
+    if (spawnSync('curl', ['-sf', '-m', '3', 'http://127.0.0.1:11434/api/version']).status !== 0) return 'Ollama не отвечает. Запустите приложение Ollama и повторите /new.'
+  }
+  const msg = await newLaunch(dir, !!f.resume, opt ? { model: opt.id, local: opt.local } : {})
+  if (opt) { // запомнить модель, как только сессия зарегистрируется в роутере
+    const key = `${dir}::main`
+    void (async () => { for (let i = 0; i < 40; i++) { await Bun.sleep(1000); const s = sessions[key]; if (s) { s.model = modelShort(opt.id); s.local = opt.local; saveSessions(); queueRename(key); return } } })()
+  }
+  return msg
+}
+
 async function newLaunch(dir: string, resume: boolean, o: { model?: string; local?: boolean; key?: string } = {}): Promise<string> {
   const name = tmuxNameFor({ dir })
   if (teleTmuxSessions().includes(name)) return `Сессия ${name} уже запущена. Её тема в группе; окно: /show ${name.replace(/^tele-/, '')}`
@@ -911,10 +934,9 @@ async function newFolderName(text: string): Promise<boolean> {
   const dir = join(PROJECTS_DIR, name)
   if (existsSync(dir)) { await say(`Папка ${name} уже есть. Напишите другое имя.`); return true }
   try { mkdirSync(dir, { recursive: true }) } catch (e) { await say(`Не смог создать папку: ${e}`); return true }
-  f.awaitName = false
-  await say(`Создал ${dir.replace(HOME, '~')}. Запускаю…`)
-  await say(await newLaunch(dir, false))
-  newFlow = undefined
+  f.awaitName = false; f.dir = dir; f.resume = false
+  const p = newModelPanel(f)
+  await say(`Создал ${dir.replace(HOME, '~')}.\n${p.text}`, { reply_markup: p.kb })
   return true
 }
 
@@ -938,11 +960,14 @@ async function newCallback(ctx: any, d: string) {
     f.dir = dir
     await edit(newModePanel(dir)); return void (await ans())
   }
-  if (act === 's' && f.dir) {
+  if (act === 's' && f.dir) { f.resume = arg === 'r'; await edit(newModelPanel(f)); return void (await ans()) }
+  if (act === 'm' && f.dir) {
     const dir = f.dir
-    await ctx.editMessageText(`Запускаю ${dir.replace(HOME, '~')}… (около 10 секунд)`).catch(() => {})
+    const opt = arg === 'd' ? undefined : f.opts?.[Number(arg)]
+    if (arg !== 'd' && !opt) return void (await ans('Список устарел, начните заново: /new'))
+    await ctx.editMessageText(`Запускаю ${dir.replace(HOME, '~')}${opt ? ' на ' + opt.label : ''}… (около 10 секунд)`).catch(() => {})
     await ans('Запускаю')
-    const msg = await newLaunch(dir, arg === 'r')
+    const msg = await newLaunchWith(f, opt)
     newFlow = undefined
     await bot.api.sendMessage(f.chat, msg, withThread(f.thread)).catch(() => {})
     return

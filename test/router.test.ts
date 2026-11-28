@@ -210,6 +210,11 @@ test('/new: показывает папки, просит имя новой и �
   await Bun.sleep(700)
   expect(calls.some(x => x.method === 'sendMessage' && String(x.body.text).includes('латинские буквы'))).toBe(true)
   expect(existsSync(join(dir, 'proj', 'плохое имя с пробелами'))).toBe(false)
+  calls.length = 0
+  updates.push(fakeUpdate('okproj'))
+  await Bun.sleep(900)
+  expect(existsSync(join(dir, 'proj', 'okproj'))).toBe(true)
+  expect(calls.some(x => x.method === 'sendMessage' && String(x.body.text).includes('Шаг 3') && JSON.stringify(x.body.reply_markup).includes('nw:m:d'))).toBe(true)
 })
 
 test('зеркало: набранное в терминале дублируется в тему, ход из Telegram не дублируется', async () => {
